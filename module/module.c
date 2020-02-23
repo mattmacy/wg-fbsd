@@ -267,7 +267,7 @@ wg_stop(if_ctx_t ctx)
 }
 
 static int
-wg_getconf(struct wg_softc *sc, struct ifdrv *ifd)
+wg_local_show(struct wg_softc *sc, struct ifdrv *ifd)
 {
 	nvlist_t *nvl;
 	void *packed;
@@ -304,7 +304,7 @@ out:
 }
 
 static int
-wg_setconf(struct wg_softc *sc, struct ifdrv *ifd)
+wg_peer_add(struct wg_softc *sc, struct ifdrv *ifd)
 {
 	int err;
 	void *nvlpacked;
@@ -352,11 +352,11 @@ wg_priv_ioctl(if_ctx_t ctx, u_long command, caddr_t data)
 			return (EINVAL);
 	}
 	switch (ifd_cmd) {
-		case WGC_GETCONF:
-			return (wg_getconf(sc, ifd));
+		case WGC_LOCAL_SHOW:
+			return (wg_local_show(sc, ifd));
 			break;
-		case WGC_SETCONF:
-			return (wg_setconf(sc, ifd));
+		case WGC_PEER_ADD:
+			return (wg_peer_add(sc, ifd));
 			break;
 	}
 	return (ENOTSUP);

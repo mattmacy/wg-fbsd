@@ -103,8 +103,12 @@ struct wg_device_io {
 #define	ENOKEY	ENOTCAPABLE
 #endif
 
-#define WGC_SETCONF	0x1
-#define WGC_GETCONF	0x2
-
+typedef enum {
+	WGC_PEER_ADD = 0x1,
+	WGC_PEER_DEL = 0x2,
+	WGC_PEER_UPDATE = 0x3,
+	WGC_PEER_LIST = 0x4,
+	WGC_LOCAL_SHOW = 0x5,
+} wg_cmd_t;
 
 #endif /* __IF_WG_H__ */
