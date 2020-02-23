@@ -328,6 +328,13 @@ enum wg_cookie_mac_state {
 
 struct wg_softc;
 
+struct wg_peer_create_info {
+	void *wpci_pub_key;
+	struct sockaddr *wpci_endpoint;
+	struct wg_allowedip *wpci_allowedip_list;
+	int wpci_allowedip_count;
+};
+
 struct wg_peer {
 	LIST_ENTRY(wg_peer)	 p_entry;
 	uint64_t		 p_id;
@@ -403,6 +410,8 @@ struct wg_peer	*
 	wg_peer_ref(struct wg_peer *);
 void	wg_peer_put(struct wg_peer *);
 void	wg_peer_remove_all(struct wg_softc *);
+int	wg_peer_create(struct wg_softc *, struct wg_peer_create_info *);
+
 
 void	wg_peer_send_staged_packets(struct wg_peer *);
 

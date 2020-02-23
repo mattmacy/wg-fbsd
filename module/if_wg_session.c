@@ -246,8 +246,6 @@ void	wg_cookie_message_create(struct wg_pkt_cookie *, struct mbuf *,
 void	wg_cookie_message_consume(struct wg_pkt_cookie *, struct wg_softc *);
 
 /* Peer */
-struct wg_peer	*
-	wg_peer_create(struct wg_softc *, uint8_t [WG_KEY_SIZE]);
 void	wg_peer_destroy(struct wg_peer **);
 void	wg_peer_free(epoch_context_t ctx);
 
@@ -2164,7 +2162,7 @@ out:
 
 /* Peer */
 struct wg_peer *
-wg_peer_create(struct wg_softc *sc, uint8_t pubkey[WG_KEY_SIZE])
+wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 {
 	struct wg_peer *peer;
 
@@ -2175,10 +2173,9 @@ wg_peer_create(struct wg_softc *sc, uint8_t pubkey[WG_KEY_SIZE])
 	peer->p_id = atomic_fetchadd_long(&peer_counter, 1);
 	if_ref(sc->sc_ifp);
 
-
 	refcount_init(&peer->p_refcnt, 0);
 
-	noise_remote_init(&peer->p_remote, pubkey);
+	noise_remote_init(&peer->p_remote, wpci->wpci_pub_key);
 
 	wg_cookie_init(&peer->p_cookie);
 	wg_cookie_precompute_peer_keys(peer);
@@ -2186,7 +2183,11 @@ wg_peer_create(struct wg_softc *sc, uint8_t pubkey[WG_KEY_SIZE])
 	noise_keypairs_init(&peer->p_keypairs);
 
 	rw_init(&peer->p_endpoint_lock, "wg_peer_endpoint");
+
 	bzero(&peer->p_endpoint, sizeof(peer->p_endpoint));
+	memcpy(&peer->p_endpoint.e_remote, wpci->wpci_endpoint,
+			    sizeof(peer->p_endpoint.e_remote));
+
 
 	mbufq_init(&peer->p_staged_packets, MAX_STAGED_PACKETS);
 	GROUPTASK_INIT(&peer->p_send_staged, 0,

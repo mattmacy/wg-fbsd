@@ -87,8 +87,8 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	void *packed;
 	int size, err;
 	uint16_t listen_port;
-	const void *priv_key;
-	size_t priv_size;
+	const void *pub_key;
+	size_t pub_size;
 
 	err = 0;
 	if (copyin(params, &iov, sizeof(iov)))
@@ -306,9 +306,14 @@ out:
 static int
 wg_peer_add(struct wg_softc *sc, struct ifdrv *ifd)
 {
-	int err;
+	int i, err, allowedip_count;
 	void *nvlpacked;
 	nvlist_t *nvl;
+	struct sockaddr *endpoint;
+	const void *pub_key;
+	struct wg_allowedip *allowedip_list;
+	struct wg_peer_create_info wpci;
+	size_t size;
 
 	if (ifd->ifd_len == 0 || ifd->ifd_data == NULL)
 		return (EFAULT);
@@ -322,16 +327,56 @@ wg_peer_add(struct wg_softc *sc, struct ifdrv *ifd)
 		err = EBADMSG;
 		goto out;
 	}
-	if (nvlist_exists_number(nvl, "listen-port")) {
-
+	if (!nvlist_exists_binary(nvl, "public-key")) {
+		device_printf(dev, "no public key provided for peer\n");
+		err = EBADMSG;
+		goto out;
 	}
-	if (nvlist_exists_binary(nvl, "private-key")) {
-
+	if (!nvlist_exists_binary(nvl, "endpoint")) {
+		device_printf(dev, "no endpoint provided for peer\n");
+		err = EBADMSG;
+		goto out;
 	}
-	if (nvlist_exists_binary(nvl, "public-key")) {
-
+	if (!nvlist_exists_binary(nvl, "allowed-ips")) {
+		device_printf(dev, "no allowed-ips provided for peer\n");
+		err = EBADMSG;
+		goto out;
 	}
- out:
+	pub_key = nvlist_get_binary(nvl, "public-key", &size);
+	if (size != CURVE25519_KEY_SIZE) {
+		device_printf(dev, "%s bad length for public-key %zu\n", __func__, size);
+		err = EBADMSG;
+		goto nvl_out;
+	}
+	endpoint = nvlist_get_binary(nvl, "endpoint", &size);
+	if (size != sizeof(*endpoint)) {
+		device_printf(dev, "%s bad length for endpoint %zu\n", __func__, size);
+		err = EBADMSG;
+		goto nvl_out;
+	}
+	allowedip_list = nvlist_get_binary(nvl, "allowed-ips", &size);
+	if (size % sizeof(struct wg_allowedip) != 0) {
+		device_printf(dev, "%s bad length for allowed-ips %zu not integer multiple of struct size\n", __func__, size);
+		err = EBADMSG;
+		goto nvl_out;
+	}
+	allowedip_count = size/sizeof(struct wg_allowedip);
+	for (i = 0; i < allowedip_count; i++) {
+		if (!wg_allowedip_valid(&allowedip_list[i])) {
+			device_printf(dev, "%s allowedip %d not valid\n", __func__, i);
+			err = EBADMSG;
+			goto nvl_out;
+		}
+	}
+	wpci.wpci_pub_key = pub_key;
+	wpci.wpci_endpoint = endpoint;
+	wpci.wpci_allowedip_list = allowedip_list;
+	wpci.wpci_allowedip_count = allowedip_count;
+
+	err = wg_peer_create(sc, &wpci);
+ nvl_out:
+	nvlist_destroy(nvl);
+out:
 	free(nvlpacked, M_TEMP);
 	return (err);
 }
