@@ -10,7 +10,6 @@
 #include <sys/types.h>
 
 struct scatterlist;
-typedef struct simd_context simd_context_t;
 
 enum chacha20poly1305_lengths {
 	XCHACHA20POLY1305_NONCE_SIZE = 24,

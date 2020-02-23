@@ -5,8 +5,6 @@
 
 #define CURVE25519_KEY_SIZE 32
 
-typedef uint8_t u8;
-
 void curve25519_generic(u8 [CURVE25519_KEY_SIZE],
 			const u8 [CURVE25519_KEY_SIZE],
 			const u8 [CURVE25519_KEY_SIZE]);

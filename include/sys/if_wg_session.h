@@ -51,38 +51,15 @@
 #define WG_CIDRS_FOREACH(c, p) \
 	for (c = (p)->p_cidrs; c < (p)->p_cidrs + (p)->p_num_cidrs; c++)
 
-#define wg_cidr wg_cidr_io
-
-struct wg_cidr_io {
-	sa_family_t		c_af;
-	uint8_t			c_mask;
-	union {
-		struct in_addr	ipv4;
-		struct in6_addr	ipv6;
-	}			c_ip;
+struct wg_allowedip {
+	struct sockaddr a_addr;
+	struct sockaddr a_mask;
 };
 
 enum {
 	WG_PEER_CTR_TX_BYTES,
 	WG_PEER_CTR_RX_BYTES,
 	WG_PEER_CTR_NUM,
-};
-
-struct wg_peer_io {
-	uint8_t			 p_flags;
-	uint8_t			 p_pubkey[WG_KEY_SIZE];
-	uint8_t			 p_sharedkey[WG_KEY_SIZE];
-	uint16_t		 p_persistentkeepalive;
-	size_t			 p_num_cidrs;
-	struct timespec		 p_last_handshake;
-	struct wg_cidr_io	*p_cidrs;
-	uint64_t	p_tx_bytes;
-	uint64_t	p_rx_bytes;
-	union {
-		struct sockaddr		p_sa;
-		struct sockaddr_in	p_in;
-		struct sockaddr_in6	p_in6;
-	};
 };
 
 struct wg_device_io {
@@ -95,7 +72,6 @@ struct wg_device_io {
 	size_t			 d_num_peers;
 	size_t			 d_num_cidrs;
 	struct wg_peer_io	*d_peers;
-	struct wg_cidr_io	*d_cidrs;
 };
 
 
@@ -103,8 +79,13 @@ struct wg_device_io {
 #define	ENOKEY	ENOTCAPABLE
 #endif
 
-#define WGC_SETCONF	0x1
-#define WGC_GETCONF	0x2
-
+typedef enum {
+	WGC_PEER_ADD = 0x1,
+	WGC_PEER_DEL = 0x2,
+	WGC_PEER_UPDATE = 0x3,
+	WGC_PEER_LIST = 0x4,
+	WGC_GET = 0x5,
+	WGC_SET = 0x6,
+} wg_cmd_t;
 
 #endif /* __IF_WG_H__ */

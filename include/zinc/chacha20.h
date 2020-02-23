@@ -7,10 +7,7 @@
 #define _ZINC_CHACHA20_H
 
 #include <sys/param.h>
-
-typedef	uint8_t u8;
-typedef	uint32_t u32;
-typedef	uint64_t u64;
+#include <sys/support.h>
 
 enum chacha20_lengths {
 	CHACHA20_NONCE_SIZE = 16,
