@@ -1,0 +1,17 @@
+cscope.files
+cscope.out
+?*.o
+?*#*
+?.*#
+?*~
+?*.ko
+?*.ko.debug
+?*.ko.full
+module/opt_inet.h
+module/opt_inet6.h
+module/bus_if.h
+module/device_if.h
+module/ifdi_if.h
+module/export_syms
+module/machine
+module/x86
