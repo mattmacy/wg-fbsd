@@ -85,10 +85,10 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	struct iovec iov;
 	nvlist_t *nvl;
 	void *packed;
-	int size, err;
+	int err;
 	uint16_t listen_port;
-	const void *pub_key;
-	size_t pub_size;
+	const void *key;
+	size_t size;
 
 	err = 0;
 	if (copyin(params, &iov, sizeof(iov)))
@@ -119,17 +119,17 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 		err = EBADMSG;
 		goto nvl_out;
 	}
-	priv_key = nvlist_get_binary(nvl, "private-key", &priv_size);
-	if (priv_size != CURVE25519_KEY_SIZE) {
-		device_printf(dev, "%s bad length for private-key %zu\n", __func__, priv_size);
+	key = nvlist_get_binary(nvl, "private-key", &size);
+	if (size != CURVE25519_KEY_SIZE) {
+		device_printf(dev, "%s bad length for private-key %zu\n", __func__, size);
 		err = EBADMSG;
 		goto nvl_out;
 	}
 
 	sc->sc_socket.so_port = listen_port;
-	memcpy(sc->sc_local.l_private, priv_key, priv_size);
+	memcpy(sc->sc_local.l_private, key, size);
 	curve25519_clamp_secret(sc->sc_local.l_private);
-	curve25519_generate_public(sc->sc_local.l_public, priv_key);
+	curve25519_generate_public(sc->sc_local.l_public, key);
 
 	atomic_add_int(&clone_count, 1);
 	scctx = sc->shared = iflib_get_softc_ctx(ctx);
@@ -303,15 +303,23 @@ out:
 	return (err);
 }
 
+static bool
+wg_allowedip_valid(const struct wg_allowedip *wip)
+{
+
+	return (true);
+}
+
 static int
 wg_peer_add(struct wg_softc *sc, struct ifdrv *ifd)
 {
 	int i, err, allowedip_count;
 	void *nvlpacked;
 	nvlist_t *nvl;
-	struct sockaddr *endpoint;
+	device_t dev;
+	const struct sockaddr *endpoint;
 	const void *pub_key;
-	struct wg_allowedip *allowedip_list;
+	const struct wg_allowedip *allowedip_list;
 	struct wg_peer_create_info wpci;
 	size_t size;
 
@@ -327,6 +335,7 @@ wg_peer_add(struct wg_softc *sc, struct ifdrv *ifd)
 		err = EBADMSG;
 		goto out;
 	}
+	dev = iflib_get_dev(sc->wg_ctx);
 	if (!nvlist_exists_binary(nvl, "public-key")) {
 		device_printf(dev, "no public key provided for peer\n");
 		err = EBADMSG;

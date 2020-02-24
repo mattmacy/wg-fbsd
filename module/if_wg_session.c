@@ -141,9 +141,9 @@ void	wg_pktq_pkt_done(struct wg_queue_pkt *);
 /* Route */
 void	wg_route_destroy(struct wg_route_table *);
 int	wg_route_add(struct wg_route_table *, struct wg_peer *,
-			     struct wg_cidr *);
+			     struct wg_allowedip *);
 int	wg_route_delete(struct wg_route_table *, struct wg_peer *,
-				struct wg_cidr *);
+				struct wg_allowedip *);
 
 
 /* Hashtable */
@@ -162,7 +162,7 @@ void	wg_hashtable_keypair_remove(struct wg_hashtable *,
 				    struct noise_keypair *);
 
 /* Noise */
-void	noise_remote_init(struct noise_remote *, uint8_t [WG_KEY_SIZE]);
+void	noise_remote_init(struct noise_remote *, const uint8_t [WG_KEY_SIZE]);
 void	noise_remote_set_psk(struct noise_remote *, uint8_t [WG_KEY_SIZE]);
 void	noise_local_init(struct noise_local *);
 void	noise_local_set_private(struct noise_local *,
@@ -938,18 +938,23 @@ wg_route_destroy(struct wg_route_table *tbl)
 
 int
 wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
-	     struct wg_cidr *cidr)
+	     struct wg_allowedip *cidr)
 {
 	struct radix_node	*node;
 	struct radix_node_head	*root;
 	struct wg_route *route;
+	sa_family_t family;
+	void *addr;
 	bool needfree = false;
 
-	if (cidr->c_af == AF_INET)
+	family = cidr->a_addr.sa_family;
+	if (family == AF_INET) {
+		addr = &((struct sockaddr_in *)(&cidr->a_addr))->sin_addr;
 		root = tbl->t_ip;
-	else if (cidr->c_af == AF_INET6)
+	} else if (family == AF_INET6) {
+		addr = &((struct sockaddr_in6 *)(&cidr->a_addr))->sin6_addr;
 		root = tbl->t_ip6;
-	else
+	} else
 		return (EINVAL);
 
 	route = malloc(sizeof(*route), M_WG, M_NOWAIT|M_ZERO);
@@ -957,7 +962,7 @@ wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
 		return (ENOBUFS);
 
 	RADIX_NODE_HEAD_LOCK(root);
-	node = root->rnh_addaddr(&cidr->c_ip, &cidr->c_mask, &root->rh,
+	node = root->rnh_addaddr(addr, &cidr->a_mask, &root->rh,
 							&route->r_node);
 	if (node == &route->r_node) {
 		tbl->t_count++;
@@ -975,26 +980,31 @@ wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
 
 int
 wg_route_delete(struct wg_route_table *tbl, struct wg_peer *peer,
-		struct wg_cidr *cidr)
+		struct wg_allowedip *cidr)
 {
 	int ret = 0;
 	struct radix_node	*node;
 	struct radix_node_head	*root;
 	struct wg_route *route = NULL;
 	bool needfree = false;
+	sa_family_t family;
+	void *addr;
 
-	if (cidr->c_af == AF_INET)
+	family = cidr->a_addr.sa_family;
+	if (family == AF_INET) {
+		addr = &((struct sockaddr_in *)(&cidr->a_addr))->sin_addr;
 		root = tbl->t_ip;
-	else if (cidr->c_af == AF_INET6)
+	} else if (family == AF_INET6) {
+		addr = &((struct sockaddr_in6 *)(&cidr->a_addr))->sin6_addr;
 		root = tbl->t_ip6;
-	else
+	} else
 		return EINVAL;
 
 
 	RADIX_NODE_HEAD_LOCK(root);
-	if ((node = root->rnh_matchaddr(&cidr->c_ip, &root->rh)) != NULL) {
+	if ((node = root->rnh_matchaddr(addr, &root->rh)) != NULL) {
 
-		if (root->rnh_deladdr(&cidr->c_ip, &cidr->c_mask, &root->rh) == NULL)
+		if (root->rnh_deladdr(addr, &cidr->a_mask, &root->rh) == NULL)
 			panic("art_delete failed to delete node %p", node);
 
 		/* We can type alias as node is the first elem in route */
@@ -1193,7 +1203,7 @@ wg_hashtable_keypair_remove(struct wg_hashtable *ht,
 
 /* Noise */
 void
-noise_remote_init(struct noise_remote *remote, uint8_t pubkey[WG_KEY_SIZE])
+noise_remote_init(struct noise_remote *remote, const uint8_t pubkey[WG_KEY_SIZE])
 {
 	bzero(remote, sizeof(*remote));
 	mtx_init(&remote->r_mtx, "noise remote", NULL, MTX_DEF);
@@ -2161,14 +2171,14 @@ out:
 }
 
 /* Peer */
-struct wg_peer *
+int
 wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 {
 	struct wg_peer *peer;
 
 	peer = malloc(sizeof(*peer), M_WG, M_ZERO|M_NOWAIT);
 	if (peer == NULL)
-		return NULL;
+		return (ENOMEM);
 
 	peer->p_id = atomic_fetchadd_long(&peer_counter, 1);
 	if_ref(sc->sc_ifp);
@@ -2209,7 +2219,7 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	wg_hashtable_peer_insert(&sc->sc_hashtable, peer);
 
 	DPRINTF(sc, "Peer %llu created\n", peer->p_id);
-	return peer;
+	return (0);
 }
 
 struct wg_peer *
@@ -3188,7 +3198,7 @@ free:
 		m_freem(m);
 	}
 }
-
+#if 0
 int
 wg_ioctl_set(struct wg_softc *sc, struct wg_device_io *dev)
 {
@@ -3393,7 +3403,7 @@ wg_ioctl(struct ifnet * ifp, u_long cmd, caddr_t data)
 		return ENOTTY;
 	}
 }
-
+#endif
 /*
  * XXX
  */

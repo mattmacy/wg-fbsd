@@ -51,15 +51,9 @@
 #define WG_CIDRS_FOREACH(c, p) \
 	for (c = (p)->p_cidrs; c < (p)->p_cidrs + (p)->p_num_cidrs; c++)
 
-#define wg_cidr wg_cidr_io
-
-struct wg_cidr_io {
-	sa_family_t		c_af;
-	uint8_t			c_mask;
-	union {
-		struct in_addr	ipv4;
-		struct in6_addr	ipv6;
-	}			c_ip;
+struct wg_allowedip {
+	struct sockaddr a_addr;
+	int a_mask;
 };
 
 enum {
@@ -68,6 +62,7 @@ enum {
 	WG_PEER_CTR_NUM,
 };
 
+#if 0
 struct wg_peer_io {
 	uint8_t			 p_flags;
 	uint8_t			 p_pubkey[WG_KEY_SIZE];
@@ -84,6 +79,7 @@ struct wg_peer_io {
 		struct sockaddr_in6	p_in6;
 	};
 };
+#endif
 
 struct wg_device_io {
 	char			 d_name[IFNAMSIZ];
@@ -95,7 +91,6 @@ struct wg_device_io {
 	size_t			 d_num_peers;
 	size_t			 d_num_cidrs;
 	struct wg_peer_io	*d_peers;
-	struct wg_cidr_io	*d_cidrs;
 };
 
 

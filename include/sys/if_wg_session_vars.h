@@ -214,7 +214,7 @@ struct wg_route_table {
 struct wg_route {
 	struct radix_node		 r_node;
 	CK_LIST_ENTRY(wg_route)	 r_entry;
-	struct wg_cidr		 r_cidr;
+	struct wg_allowedip		 r_cidr;
 	struct wg_peer		*r_peer;
 };
 
@@ -329,9 +329,9 @@ enum wg_cookie_mac_state {
 struct wg_softc;
 
 struct wg_peer_create_info {
-	void *wpci_pub_key;
-	struct sockaddr *wpci_endpoint;
-	struct wg_allowedip *wpci_allowedip_list;
+	const void *wpci_pub_key;
+	const struct sockaddr *wpci_endpoint;
+	const struct wg_allowedip *wpci_allowedip_list;
 	int wpci_allowedip_count;
 };
 
