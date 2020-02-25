@@ -390,6 +390,51 @@ out:
 	return (err);
 }
 
+static nvlist_t *
+wg_peer_to_nvl(struct wg_peer *peer)
+{
+	struct wg_route *rt;
+	int i, count;
+	nvlist_t *nvl;
+	caddr_t key;
+	struct wg_allowedip *aip;
+
+	if ((nvl = nvlist_create(0)) == NULL)
+		return (NULL);
+	key = peer->p_remote.r_public;
+	nvlist_add_binary(nvl, "public-key", key, WG_KEY_SIZE);
+	nvlist_add_binary(nvl, "endpoint", &peer->p_endpoint.e_remote, sizeof(struct sockaddr));
+	i = count = 0;
+	CK_LIST_FOREACH(rt, &peer->p_routes, r_entry) {
+		count++;
+	}
+	aip = malloc(count*sizeof(*aip), M_TEMP, M_WAITOK);
+	CK_LIST_FOREACH(rt, &peer->p_routes, r_entry) {
+		memcpy(&aip[i++], &rt->r_cidr, sizeof(*aip));
+	}
+	nvlist_add_binary(nvl, "allowed-ips", aip, count*sizeof(*aip));
+	free(aip, M_TEMP);
+	return (nvl);
+}
+
+static int
+wg_peer_list(struct wg_softc *sc, struct ifdrv *ifd)
+{
+#ifdef notyet
+	int i, err, allowedip_count;
+	void *nvlpacked;
+	nvlist_t *nvl;
+	device_t dev;
+	const struct sockaddr *endpoint;
+	const void *pub_key;
+	const struct wg_allowedip *allowedip_list;
+	size_t size;
+#endif
+	return (0);
+}
+
+
+
 static int
 wg_priv_ioctl(if_ctx_t ctx, u_long command, caddr_t data)
 {
@@ -410,6 +455,9 @@ wg_priv_ioctl(if_ctx_t ctx, u_long command, caddr_t data)
 			return (wg_local_show(sc, ifd));
 			break;
 		case WGC_PEER_ADD:
+			return (wg_peer_add(sc, ifd));
+			break;
+		case WGC_PEER_LIST:
 			return (wg_peer_add(sc, ifd));
 			break;
 	}
