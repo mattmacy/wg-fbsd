@@ -2280,8 +2280,6 @@ wg_peer_free(epoch_context_t ctx)
 	counter_u64_free(peer->p_tx_bytes);
 	counter_u64_free(peer->p_rx_bytes);
 
-	if_free(peer->p_sc->sc_ifp);
-
 	DPRINTF(peer->p_sc, "Peer %llu destroyed\n", peer->p_id);
 	zfree(peer, M_WG);
 }
