@@ -62,6 +62,7 @@
 
 #define	GROUPTASK_DRAIN(gtask)			\
 	gtaskqueue_drain((gtask)->gt_taskqueue, &(gtask)->gt_task)
+TASKQGROUP_DECLARE(if_io_tqg);
 
 
 /*
@@ -2175,11 +2176,13 @@ int
 wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 {
 	struct wg_peer *peer;
+	device_t dev;
 
 	peer = malloc(sizeof(*peer), M_WG, M_ZERO|M_NOWAIT);
 	if (peer == NULL)
 		return (ENOMEM);
 
+	dev = iflib_get_dev(sc->wg_ctx);
 	peer->p_id = atomic_fetchadd_long(&peer_counter, 1);
 
 	refcount_init(&peer->p_refcnt, 0);
@@ -2196,19 +2199,20 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	bzero(&peer->p_endpoint, sizeof(peer->p_endpoint));
 	memcpy(&peer->p_endpoint.e_remote, wpci->wpci_endpoint,
 			    sizeof(peer->p_endpoint.e_remote));
-
-
 	mbufq_init(&peer->p_staged_packets, MAX_STAGED_PACKETS);
-	GROUPTASK_INIT(&peer->p_send_staged, 0,
-	    (gtask_fn_t *)wg_peer_send_staged_packets_ref, peer);
-
 	wg_pktq_init(&peer->p_send_queue, "sendq");
 	wg_pktq_init(&peer->p_recv_queue, "rxq");
-	GROUPTASK_INIT(&peer->p_send, 0, (gtask_fn_t *)wg_peer_send, peer);
-	GROUPTASK_INIT(&peer->p_recv, 0, (gtask_fn_t *)wg_peer_recv, peer);
 
+	GROUPTASK_INIT(&peer->p_send_staged, 0,
+	    (gtask_fn_t *)wg_peer_send_staged_packets_ref, peer);
+	taskqgroup_attach(qgroup_if_io_tqg, &peer->p_send_staged, peer, dev, NULL, "wg send staged");
+	GROUPTASK_INIT(&peer->p_send, 0, (gtask_fn_t *)wg_peer_send, peer);
+	taskqgroup_attach(qgroup_if_io_tqg, &peer->p_send, peer, dev, NULL, "wg send");
+	GROUPTASK_INIT(&peer->p_recv, 0, (gtask_fn_t *)wg_peer_recv, peer);
+	taskqgroup_attach(qgroup_if_io_tqg, &peer->p_recv, peer, dev, NULL, "wg recv");
 	GROUPTASK_INIT(&peer->p_tx_initiation, 0,
 	    (gtask_fn_t *)wg_peer_send_handshake_initiation, peer);
+	taskqgroup_attach(qgroup_if_io_tqg, &peer->p_tx_initiation, peer, dev, NULL, "wg tx initiation");
 
 	peer->p_tx_bytes = counter_u64_alloc(M_WAITOK);
 	peer->p_rx_bytes = counter_u64_alloc(M_WAITOK);
