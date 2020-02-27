@@ -2264,9 +2264,14 @@ wg_peer_destroy(struct wg_peer **peer_p)
 	/* TODO currently, if there is a timer added after here, then the peer
 	 * can hang around for longer than we want. */
 	wg_peer_timers_stop(peer);
+	GROUPTASK_DRAIN(&peer->p_send_staged);
 	GROUPTASK_DRAIN(&peer->p_send);
 	GROUPTASK_DRAIN(&peer->p_recv);
 	GROUPTASK_DRAIN(&peer->p_tx_initiation);
+	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_send_staged);
+	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_send);
+	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_recv);
+	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_tx_initiation);
 
 	wg_peer_put(peer);
 }
