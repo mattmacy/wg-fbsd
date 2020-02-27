@@ -336,7 +336,8 @@ struct wg_peer_create_info {
 };
 
 struct wg_peer {
-	LIST_ENTRY(wg_peer)	 p_entry;
+	CK_LIST_ENTRY(wg_peer)	 p_hash_entry;
+	CK_LIST_ENTRY(wg_peer)	 p_entry;
 	uint64_t		 p_id;
 	struct wg_softc		*p_sc;
 	volatile uint32_t		 p_refcnt;
@@ -370,7 +371,8 @@ struct wg_peer {
 struct wg_hashtable {
 	struct mtx			 h_mtx;
 	SIPHASH_KEY			 h_secret;
-	LIST_HEAD(, wg_peer)		*h_peers;
+	CK_LIST_HEAD(, wg_peer)		h_peers_list;
+	CK_LIST_HEAD(, wg_peer)		*h_peers;
 	u_long				 h_peers_mask;
 	size_t				 h_num_peers;
 	LIST_HEAD(, noise_keypair)	*h_keys;

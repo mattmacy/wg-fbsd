@@ -292,8 +292,6 @@ int	wg_output(struct ifnet *, struct mbuf *, struct sockaddr *,
 void
 wg_input(struct mbuf *m, int offset, struct inpcb *inpcb,
 		 const struct sockaddr *srcsa, void *_sc);
-int	wg_ioctl_set(struct wg_softc *, struct wg_device_io *);
-int	wg_ioctl_get(struct wg_softc *, struct wg_device_io *);
 int	wg_ioctl(struct ifnet *, u_long, caddr_t);
 //int	wg_clone_create(struct if_clone *, int);
 int	wg_clone_destroy(struct ifnet *);
@@ -1076,11 +1074,11 @@ wg_route_lookup(struct wg_route_table *tbl, struct mbuf *m,
 /* Hashtable */
 #define WG_HASHTABLE_PEER_FOREACH(peer, i, ht) \
 	for (i = 0; i < HASHTABLE_PEER_SIZE; i++) \
-		LIST_FOREACH(peer, &(ht)->h_peers[i], p_entry)
+		LIST_FOREACH(peer, &(ht)->h_peers[i], p_hash_entry)
 
 #define WG_HASHTABLE_PEER_FOREACH_SAFE(peer, i, ht, tpeer) \
 	for (i = 0; i < HASHTABLE_PEER_SIZE; i++) \
-		LIST_FOREACH_SAFE(peer, &(ht)->h_peers[i], p_entry, tpeer)
+		CK_LIST_FOREACH_SAFE(peer, &(ht)->h_peers[i], p_hash_entry, tpeer)
 
 void
 wg_hashtable_init(struct wg_hashtable *ht)
@@ -1114,7 +1112,8 @@ wg_hashtable_peer_insert(struct wg_hashtable *ht, struct wg_peer *peer)
 	mtx_lock(&ht->h_mtx);
 	ht->h_num_peers++;
 	peer = wg_peer_ref(peer);
-	LIST_INSERT_HEAD(&ht->h_peers[key & ht->h_peers_mask], peer, p_entry);
+	CK_LIST_INSERT_HEAD(&ht->h_peers[key & ht->h_peers_mask], peer, p_hash_entry);
+	CK_LIST_INSERT_HEAD(&ht->h_peers_list, peer, p_entry);
 	mtx_unlock(&ht->h_mtx);
 }
 
@@ -1128,7 +1127,7 @@ wg_hashtable_peer_lookup(struct wg_hashtable *ht,
 	key = siphash24(&ht->h_secret, pubkey, WG_KEY_SIZE);
 
 	mtx_lock(&ht->h_mtx);
-	LIST_FOREACH(i, &ht->h_peers[key & ht->h_peers_mask], p_entry) {
+	CK_LIST_FOREACH(i, &ht->h_peers[key & ht->h_peers_mask], p_hash_entry) {
 		if (timingsafe_bcmp(i->p_remote.r_public, pubkey,
 					WG_KEY_SIZE) == 0) {
 			peer = wg_peer_ref(i);
@@ -1145,7 +1144,8 @@ wg_hashtable_peer_remove(struct wg_hashtable *ht, struct wg_peer *peer)
 {
 	mtx_lock(&ht->h_mtx);
 	ht->h_num_peers--;
-	LIST_REMOVE(peer, p_entry);
+	CK_LIST_REMOVE(peer, p_hash_entry);
+	CK_LIST_REMOVE(peer, p_entry);
 	wg_peer_put(peer);
 	mtx_unlock(&ht->h_mtx);
 }
@@ -2181,7 +2181,6 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 		return (ENOMEM);
 
 	peer->p_id = atomic_fetchadd_long(&peer_counter, 1);
-	if_ref(sc->sc_ifp);
 
 	refcount_init(&peer->p_refcnt, 0);
 
@@ -2217,7 +2216,7 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	CK_LIST_INIT(&peer->p_routes);
 
 	wg_hashtable_peer_insert(&sc->sc_hashtable, peer);
-
+	peer->p_sc = sc;
 	DPRINTF(sc, "Peer %llu created\n", peer->p_id);
 	return (0);
 }
@@ -3387,22 +3386,6 @@ wg_ioctl_get(struct wg_softc *sc, struct wg_device_io *dev)
 	return 0;
 }
 
-/* The following functions are for interface control */
-int
-wg_ioctl(struct ifnet * ifp, u_long cmd, caddr_t data)
-{
-	struct wg_softc *sc = ifp->if_softc;
-
-	switch (cmd) {
-	case SIOCSWG:
-		return wg_ioctl_set(sc, (struct wg_device_io *) data);
-	case SIOCGWG:
-		return wg_ioctl_get(sc, (struct wg_device_io *) data);
-	/* Interface IOCTLs */
-	default:
-		return ENOTTY;
-	}
-}
 #endif
 /*
  * XXX
