@@ -81,7 +81,7 @@ TASKQGROUP_DECLARE(if_io_tqg);
     printf("%s: " str, (sc)->sc_if.if_xname, ##__VA_ARGS__); } while (0)
 #endif
 
-#define DPRINTF(sc, s, ...)
+#define DPRINTF(sc,  ...) if_printf(sc->sc_ifp, ##__VA_ARGS__)
 
 static inline uint64_t
 siphash24(const SIPHASH_KEY *key, const void *src, size_t len)
@@ -142,7 +142,7 @@ void	wg_pktq_pkt_done(struct wg_queue_pkt *);
 /* Route */
 void	wg_route_destroy(struct wg_route_table *);
 int	wg_route_add(struct wg_route_table *, struct wg_peer *,
-			     struct wg_allowedip *);
+			     const struct wg_allowedip *);
 int	wg_route_delete(struct wg_route_table *, struct wg_peer *,
 				struct wg_allowedip *);
 
@@ -573,7 +573,7 @@ wg_peer_expired_retransmit_handshake(struct wg_peer *peer)
 {
 	rw_wlock(&peer->p_timers.t_lock);
 	if (peer->p_timers.t_handshake_attempts > MAX_TIMER_HANDSHAKES) {
-		DPRINTF(peer->p_sc, "Handshake for peer %llu did not complete "
+		DPRINTF(peer->p_sc, "Handshake for peer %lu did not complete "
 				"after %d attempts, giving up\n", peer->p_id,
 				peer->p_timers.t_handshake_attempts);
 
@@ -589,7 +589,7 @@ wg_peer_expired_retransmit_handshake(struct wg_peer *peer)
 				wg_peer_ref(peer);
 	} else {
 		peer->p_timers.t_handshake_attempts++;
-		DPRINTF(peer->p_sc, "Handshake for peer %llu did not complete "
+		DPRINTF(peer->p_sc, "Handshake for peer %lu did not complete "
 				"after %d seconds, retrying (try %d)\n",
 				peer->p_id, REKEY_TIMEOUT,
 				peer->p_timers.t_handshake_attempts);
@@ -627,7 +627,7 @@ wg_peer_expired_send_keepalive(struct wg_peer *peer)
 void
 wg_peer_expired_new_handshake(struct wg_peer *peer)
 {
-	DPRINTF(peer->p_sc, "Retrying handshake with peer %llu because we "
+	DPRINTF(peer->p_sc, "Retrying handshake with peer %lu because we "
 			"stopped hearing back after %d seconds\n", peer->p_id,
 			NEW_HANDSHAKE_TIMEOUT);
 
@@ -643,7 +643,7 @@ wg_peer_expired_new_handshake(struct wg_peer *peer)
 void
 wg_peer_expired_zero_key_material(struct wg_peer *peer)
 {
-	DPRINTF(peer->p_sc, "Zeroing out all keys for peer %llu, since we "
+	DPRINTF(peer->p_sc, "Zeroing out all keys for peer %lu, since we "
 			"haven't received a new one in %d seconds\n",
 			peer->p_id, REJECT_AFTER_TIME * 3);
 
@@ -937,21 +937,22 @@ wg_route_destroy(struct wg_route_table *tbl)
 
 int
 wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
-	     struct wg_allowedip *cidr)
+			 const struct wg_allowedip *cidr)
 {
 	struct radix_node	*node;
 	struct radix_node_head	*root;
 	struct wg_route *route;
 	sa_family_t family;
-	void *addr;
+	const void *addr;
+	int mask = cidr->a_mask;
 	bool needfree = false;
 
 	family = cidr->a_addr.sa_family;
 	if (family == AF_INET) {
-		addr = &((struct sockaddr_in *)(&cidr->a_addr))->sin_addr;
+		addr = &((const struct sockaddr_in *)(&cidr->a_addr))->sin_addr;
 		root = tbl->t_ip;
 	} else if (family == AF_INET6) {
-		addr = &((struct sockaddr_in6 *)(&cidr->a_addr))->sin6_addr;
+		addr = &((const struct sockaddr_in6 *)(&cidr->a_addr))->sin6_addr;
 		root = tbl->t_ip6;
 	} else
 		return (EINVAL);
@@ -961,7 +962,7 @@ wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
 		return (ENOBUFS);
 
 	RADIX_NODE_HEAD_LOCK(root);
-	node = root->rnh_addaddr(addr, &cidr->a_mask, &root->rh,
+	node = root->rnh_addaddr(__DECONST(void *, addr), &mask, &root->rh,
 							&route->r_node);
 	if (node == &route->r_node) {
 		tbl->t_count++;
@@ -1271,7 +1272,7 @@ noise_keypair_attach_to_peer(struct noise_keypair *keypair,
 
 	mtx_unlock(&keypair->k_mtx);
 
-	DPRINTF(keypair->k_peer->p_sc, "Keypair %llu created for peer %llu\n",
+	DPRINTF(keypair->k_peer->p_sc, "Keypair %lu created for peer %lu\n",
 		keypair->k_id, keypair->k_peer->p_id);
 }
 
@@ -1309,7 +1310,7 @@ noise_keypair_destroy(struct noise_keypair **keypair_p)
 void
 noise_keypair_free(struct noise_keypair *keypair)
 {
-	DPRINTF(keypair->k_peer->p_sc, "Keypair %llu destroyed\n",
+	DPRINTF(keypair->k_peer->p_sc, "Keypair %lu destroyed\n",
 		keypair->k_id);
 	wg_peer_put(keypair->k_peer);
 	zfree(keypair, M_WG);
@@ -2176,11 +2177,19 @@ int
 wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 {
 	struct wg_peer *peer;
+	const struct wg_allowedip *aip;
 	device_t dev;
+	int err;
 
-	peer = malloc(sizeof(*peer), M_WG, M_ZERO|M_NOWAIT);
-	if (peer == NULL)
-		return (ENOMEM);
+	peer = malloc(sizeof(*peer), M_WG, M_ZERO);
+	CK_LIST_INIT(&peer->p_routes);
+
+	aip = wpci->wpci_allowedip_list;
+	for (int i = 0; i < wpci->wpci_allowedip_count; i++, aip++) {
+		if ((err = wg_route_add(&sc->sc_routes, peer, aip)) != 0) {
+			printf("route add failed\n");
+		}
+	}
 
 	dev = iflib_get_dev(sc->wg_ctx);
 	peer->p_id = atomic_fetchadd_long(&peer_counter, 1);
@@ -2217,11 +2226,11 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	peer->p_tx_bytes = counter_u64_alloc(M_WAITOK);
 	peer->p_rx_bytes = counter_u64_alloc(M_WAITOK);
 
-	CK_LIST_INIT(&peer->p_routes);
 
 	wg_hashtable_peer_insert(&sc->sc_hashtable, peer);
 	peer->p_sc = sc;
-	DPRINTF(sc, "Peer %llu created\n", peer->p_id);
+	DPRINTF(sc, "Peer %lu created\n", peer->p_id);
+	MPASS(sc->sc_hashtable.h_num_peers > 0);
 	return (0);
 }
 
@@ -2285,7 +2294,7 @@ wg_peer_free(epoch_context_t ctx)
 	counter_u64_free(peer->p_tx_bytes);
 	counter_u64_free(peer->p_rx_bytes);
 
-	DPRINTF(peer->p_sc, "Peer %llu destroyed\n", peer->p_id);
+	DPRINTF(peer->p_sc, "Peer %lu destroyed\n", peer->p_id);
 	zfree(peer, M_WG);
 }
 
@@ -2320,7 +2329,7 @@ wg_peer_send_handshake_initiation(struct wg_peer *peer)
 	getnanotime(&peer->p_timers.t_last_sent_handshake);
 	rw_wunlock(&peer->p_timers.t_lock);
 
-	DPRINTF(peer->p_sc, "Sending handshake initiation to peer %llu\n",
+	DPRINTF(peer->p_sc, "Sending handshake initiation to peer %lu\n",
 			peer->p_id);
 
 	if (noise_handshake_create_initiation(&init, peer) == 0) {
@@ -2345,7 +2354,7 @@ wg_peer_send_handshake_response(struct wg_peer *peer)
 	getnanotime(&peer->p_timers.t_last_sent_handshake);
 	rw_wunlock(&peer->p_timers.t_lock);
 
-	DPRINTF(peer->p_sc, "Sending handshake response to peer %llu\n",
+	DPRINTF(peer->p_sc, "Sending handshake response to peer %lu\n",
 			peer->p_id);
 
 	if (noise_handshake_create_response(&resp, peer) == 0) {
@@ -2492,7 +2501,7 @@ wg_peer_send_keepalive(struct wg_peer *peer)
 	    (m = m_gethdr(M_NOWAIT, MT_DATA)) != NULL) {
 		mbufq_enqueue(&peer->p_staged_packets, m);
 
-		DPRINTF(peer->p_sc, "Sending keepalive packet to peer %llu\n",
+		DPRINTF(peer->p_sc, "Sending keepalive packet to peer %lu\n",
 				peer->p_id);
 	}
 
@@ -2826,7 +2835,7 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 			goto free;
 		}
 		wg_peer_set_endpoint_from_mbuf(keypair->k_peer, m);
-		DPRINTF(sc, "Receiving handshake initiation from peer %llu\n",
+		DPRINTF(sc, "Receiving handshake initiation from peer %lu\n",
 				keypair->k_peer->p_id);
 		wg_peer_send_handshake_response(keypair->k_peer);
 		break;
@@ -2844,7 +2853,7 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 			goto free;
 		}
 		wg_peer_set_endpoint_from_mbuf(keypair->k_peer, m);
-		DPRINTF(sc, "Receiving handshake response from peer %llu\n",
+		DPRINTF(sc, "Receiving handshake response from peer %lu\n",
 				keypair->k_peer->p_id);
 		if (noise_keypairs_begin_session(
 					&keypair->k_peer->p_keypairs) == 0) {
@@ -2954,8 +2963,8 @@ wg_queue_pkt_decrypt(struct wg_queue_pkt *pkt)
 		goto drop;
 
 	if (wg_counter_validate(&keypair->k_counter, pkt->p_nonce) != 0) {
-		DPRINTF(peer->p_sc, "Packet has invalid nonce %llu (max "
-			"%llu), from peer %llu\n", pkt->p_nonce,
+		DPRINTF(peer->p_sc, "Packet has invalid nonce %lu (max "
+			"%lu), from peer %lu\n", pkt->p_nonce,
 			keypair->k_counter.c_recv, peer->p_id);
 		goto drop;
 	}
@@ -2982,7 +2991,7 @@ wg_queue_pkt_decrypt(struct wg_queue_pkt *pkt)
 	/* A packet with length 0 is a keepalive packet */
 	if (m->m_pkthdr.len == 0) {
 		DPRINTF(peer->p_sc, "Receiving keepalive packet from peer "
-				"%llu\n", peer->p_id);
+				"%lu\n", peer->p_id);
 		pkt->p_state = WG_PKT_STATE_DEAD;
 		goto drop;
 	}
@@ -2991,7 +3000,7 @@ wg_queue_pkt_decrypt(struct wg_queue_pkt *pkt)
 	version = mtod(m, struct ip *)->ip_v;
 	if (version != IPVERSION && version != 6) {
 		DPRINTF(peer->p_sc, "Packet is neither ipv4 nor ipv6 from peer "
-				"%llu\n", peer->p_id);
+				"%lu\n", peer->p_id);
 		goto drop;
 	}
 
@@ -2999,7 +3008,7 @@ wg_queue_pkt_decrypt(struct wg_queue_pkt *pkt)
 	wg_peer_put(routed_peer);
 	if (routed_peer != peer) {
 		DPRINTF(peer->p_sc, "Packet has unallowed src IP from peer "
-				"%llu\n", peer->p_id);
+				"%lu\n", peer->p_id);
 		goto drop;
 	}
 
@@ -3105,7 +3114,7 @@ wg_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *sa,
 	if (peer->p_endpoint.e_remote.r_sa.sa_family != AF_INET &&
 	    peer->p_endpoint.e_remote.r_sa.sa_family != AF_INET6) {
 		DPRINTF(sc, "No valid endpoint has been configured or "
-				"discovered for peer %llu\n", peer->p_id);
+				"discovered for peer %lu\n", peer->p_id);
 		m_freem(m);
 		wg_peer_put(peer);
 		return EDESTADDRREQ;
