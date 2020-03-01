@@ -427,26 +427,56 @@ wg_peer_list(struct wg_softc *sc, struct ifdrv *ifd)
 	void *packed;
 	nvlist_t **nvl_array, *nvl;
 
+	packed = NULL;
+	if ((peer_count = sc->sc_hashtable.h_num_peers) == 0) {
+		printf("no peers found\n");
+		return (ENOENT);
+	}
 	if ((nvl = nvlist_create(0)) == NULL)
 		return (ENOMEM);
-
-	peer_count = sc->sc_hashtable.h_num_peers;
 	err = i = 0;
 	nvl_array = malloc(peer_count*sizeof(void*), M_TEMP, M_WAITOK);
 	NET_EPOCH_ENTER(et);
-	CK_LIST_FOREACH(peer, sc->sc_hashtable.h_peers, p_entry) {
+	CK_LIST_FOREACH(peer, &sc->sc_hashtable.h_peers_list, p_entry) {
 		nvl_array[i] = wg_peer_to_nvl(peer);
-		if (nvl_array[i] == NULL || peer_count == i + 1)
+		if (nvl_array[i] == NULL) {
+			printf("wg_peer_to_nvl failed on %d peer\n", i);
 			break;
+		}
+#ifdef INVARIANTS
+		packed = nvlist_pack(nvl_array[i], &size);
+		if (packed == NULL) {
+			printf("nvlist_pack(%p, %p) => %d",
+				   nvl_array[i], &size, nvlist_error(nvl));
+		}
+		free(packed, M_NVLIST);
+#endif	
 		i++;
+		if (i == peer_count)
+			break;
 	}
-	peer_count = i;
 	NET_EPOCH_EXIT(et);
+	peer_count = i;
+	if (peer_count == 0) {
+		printf("no peers found in list\n");
+		err = ENOENT;
+		goto out;
+	}
 	nvlist_add_nvlist_array(nvl, "peer-list",
 	    (const nvlist_t * const *)nvl_array, peer_count);
+	if ((err = nvlist_error(nvl))) {
+		printf("nvlist_add_nvlist_array(%p, \"peer-list\", %p, %d) => %d\n",
+			   nvl, nvl_array, peer_count, err);
+		goto out;
+	}
 	packed = nvlist_pack(nvl, &size);
 	if (packed == NULL) {
-		err = ENOMEM;
+		err = nvlist_error(nvl);
+		printf("failed to pack peer-list nvlist %d\n", err);
+		goto out;
+	}
+	if (ifd->ifd_len == 0) {
+		ifd->ifd_len = size;
 		goto out;
 	}
 	if (ifd->ifd_data == NULL) {
