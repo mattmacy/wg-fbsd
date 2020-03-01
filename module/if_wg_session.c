@@ -74,13 +74,6 @@ TASKQGROUP_DECLARE(if_io_tqg);
 #define	M_DAT_TYPE_QPKT	0x1
 #define	M_DAT_TYPE_ENDPOINT	0x2
 
-
-
-#if 0
-#define DPRINTF(sc, str, ...) do { if (ISSET((sc)->sc_if.if_flags, IFF_DEBUG)) \
-    printf("%s: " str, (sc)->sc_if.if_xname, ##__VA_ARGS__); } while (0)
-#endif
-
 #define DPRINTF(sc,  ...) if_printf(sc->sc_ifp, ##__VA_ARGS__)
 
 static inline uint64_t
@@ -915,16 +908,19 @@ wg_route_init(struct wg_route_table *tbl)
 	tbl->t_count = 0;
 	rc = rn_inithead((void **)&tbl->t_ip,
 	    offsetof(struct sockaddr_in, sin_addr) * NBBY);
+
 	if (rc == 0)
 		return (ENOMEM);
+	RADIX_NODE_HEAD_LOCK_INIT(tbl->t_ip);
 #ifdef INET6
 	rc = rn_inithead((void **)&tbl->t_ip6,
 	    offsetof(struct sockaddr_in6, sin6_addr) * NBBY);
-#endif
 	if (rc == 0) {
 		free(tbl->t_ip, M_RTABLE);
 		return (ENOMEM);
 	}
+	RADIX_NODE_HEAD_LOCK_INIT(tbl->t_ip6);
+#endif
 	return (0);
 }
 
@@ -943,38 +939,48 @@ wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
 	struct radix_node_head	*root;
 	struct wg_route *route;
 	sa_family_t family;
-	const void *addr;
 	int mask = cidr->a_mask;
 	bool needfree = false;
 
 	family = cidr->a_addr.sa_family;
 	if (family == AF_INET) {
-		addr = &((const struct sockaddr_in *)(&cidr->a_addr))->sin_addr;
+		MPASS(mask <= 32);
 		root = tbl->t_ip;
 	} else if (family == AF_INET6) {
-		addr = &((const struct sockaddr_in6 *)(&cidr->a_addr))->sin6_addr;
+		MPASS(mask <= 128);
 		root = tbl->t_ip6;
-	} else
+	} else {
+		printf("bad sa_family %d\n", cidr->a_addr.sa_family);
 		return (EINVAL);
-
+	}
 	route = malloc(sizeof(*route), M_WG, M_NOWAIT|M_ZERO);
-	if (__predict_false(route == NULL))
+	if (__predict_false(route == NULL)) {
+		printf("route allocate failed\n");
 		return (ENOBUFS);
-
+	}
 	RADIX_NODE_HEAD_LOCK(root);
-	node = root->rnh_addaddr(__DECONST(void *, addr), &mask, &root->rh,
+	node = root->rnh_addaddr(__DECONST(void *, &cidr->a_addr), &mask, &root->rh,
 							&route->r_node);
+#ifdef INVARIANTS
+	struct radix_node	*matchnode;
+	matchnode = root->rnh_matchaddr(__DECONST(void *, &cidr->a_addr), &root->rh);
+	MPASS(matchnode == node);
+	printf("node matched in matchaddr\n");
+#endif
 	if (node == &route->r_node) {
 		tbl->t_count++;
 		CK_LIST_INSERT_HEAD(&peer->p_routes, route, r_entry);
 		route->r_peer = wg_peer_ref(peer);
 		route->r_cidr = *cidr;
 	} else {
+		printf("need free of route\n");
 		needfree = true;
 	}
 	RADIX_NODE_HEAD_UNLOCK(root);
-	if (needfree)
+	if (needfree) {
+		printf("freing route 1\n");
 		free(route, M_WG);
+	}
 	return (0);
 }
 
@@ -988,23 +994,20 @@ wg_route_delete(struct wg_route_table *tbl, struct wg_peer *peer,
 	struct wg_route *route = NULL;
 	bool needfree = false;
 	sa_family_t family;
-	void *addr;
 
 	family = cidr->a_addr.sa_family;
-	if (family == AF_INET) {
-		addr = &((struct sockaddr_in *)(&cidr->a_addr))->sin_addr;
+	if (family == AF_INET)
 		root = tbl->t_ip;
-	} else if (family == AF_INET6) {
-		addr = &((struct sockaddr_in6 *)(&cidr->a_addr))->sin6_addr;
+	else if (family == AF_INET6)
 		root = tbl->t_ip6;
-	} else
+	else
 		return EINVAL;
 
 
 	RADIX_NODE_HEAD_LOCK(root);
-	if ((node = root->rnh_matchaddr(addr, &root->rh)) != NULL) {
+	if ((node = root->rnh_matchaddr(&cidr->a_addr, &root->rh)) != NULL) {
 
-		if (root->rnh_deladdr(addr, &cidr->a_mask, &root->rh) == NULL)
+		if (root->rnh_deladdr(&cidr->a_addr, &cidr->a_mask, &root->rh) == NULL)
 			panic("art_delete failed to delete node %p", node);
 
 		/* We can type alias as node is the first elem in route */
@@ -1023,8 +1026,10 @@ wg_route_delete(struct wg_route_table *tbl, struct wg_peer *peer,
 		ret = ENOATTR;
 	}
 	RADIX_NODE_HEAD_UNLOCK(root);
-	if (needfree)
+	if (needfree) {
+		printf("freing route 2\n");
 		free(route, M_WG);
+	}
 	return ret;
 }
 
@@ -2181,13 +2186,13 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	device_t dev;
 	int err;
 
-	peer = malloc(sizeof(*peer), M_WG, M_ZERO);
+	peer = malloc(sizeof(*peer), M_WG, M_WAITOK|M_ZERO);
 	CK_LIST_INIT(&peer->p_routes);
 
 	aip = wpci->wpci_allowedip_list;
 	for (int i = 0; i < wpci->wpci_allowedip_count; i++, aip++) {
 		if ((err = wg_route_add(&sc->sc_routes, peer, aip)) != 0) {
-			printf("route add failed\n");
+			printf("route add %d failed -> %d\n", i, err);
 		}
 	}
 
@@ -3213,196 +3218,6 @@ free:
 		m_freem(m);
 	}
 }
-#if 0
-int
-wg_ioctl_set(struct wg_softc *sc, struct wg_device_io *dev)
-{
-	int ret, i;
-	struct wg_peer *peer, *tpeer;
-	struct wg_route *route, *troute;
-	struct wg_peer_io peer_io, *_peer_io;
-	struct wg_cidr_io cidr_io, *_cidr_io;
-
-	/* Configure device */
-	if (dev->d_flags & WG_DEVICE_HAS_RDOMAIN)
-		if ((ret = wg_socket_rdomain_set(&sc->sc_socket,
-						 dev->d_rdomain)) != 0)
-			return ret;
-	if (dev->d_flags & WG_DEVICE_HAS_PORT)
-		if ((ret = wg_socket_port_set(&sc->sc_socket,
-					      dev->d_port) != 0))
-			return ret;
-
-	if (dev->d_flags & WG_DEVICE_REPLACE_PEERS)
-		WG_HASHTABLE_PEER_FOREACH_SAFE(peer, i,
-				&sc->sc_hashtable, tpeer) {
-			peer = wg_peer_ref(peer);
-			wg_peer_destroy(&peer);
-		}
-
-	if (dev->d_flags & WG_DEVICE_HAS_PRIVKEY) {
-		noise_local_set_private(&sc->sc_local, dev->d_privkey);
-
-		wg_cookie_checker_precompute_device_keys(sc);
-		WG_HASHTABLE_PEER_FOREACH(peer, i, &sc->sc_hashtable)
-			wg_cookie_precompute_peer_keys(peer);
-	}
-
-	/* Configure peers */
-	WG_PEERS_FOREACH(_peer_io, dev) {
-		if ((ret = copyin(_peer_io, &peer_io, sizeof(peer_io))) != 0)
-			return ret;
-
-		if (peer_io.p_flags & WG_PEER_HAS_PUBKEY) {
-			peer = wg_hashtable_peer_lookup(&sc->sc_hashtable,
-							peer_io.p_pubkey);
-
-			if (peer_io.p_flags & WG_PEER_REMOVE) {
-				if (peer == NULL)
-					return ENOENT;
-				wg_peer_destroy(&peer);
-				continue;
-			}
-
-			if (peer == NULL)
-				peer = wg_peer_create(sc, peer_io.p_pubkey);
-			/* We check again in case the create failed */
-			if (peer == NULL)
-				return ENOBUFS;
-		} else {
-			return EINVAL;
-		}
-
-		if (peer_io.p_flags & WG_PEER_HAS_ENDPOINT) {
-			rw_wlock(&peer->p_endpoint_lock);
-			memcpy(&peer->p_endpoint.e_remote, &peer_io.p_sa,
-			    sizeof(peer->p_endpoint.e_remote));
-			rw_wunlock(&peer->p_endpoint_lock);
-		}
-
-		if (peer_io.p_flags & WG_PEER_HAS_SHAREDKEY)
-			noise_remote_set_psk(&peer->p_remote,
-					     peer_io.p_sharedkey);
-
-		if (peer_io.p_flags & WG_PEER_REPLACE_CIDRS)
-			CK_LIST_FOREACH_SAFE(route,
-					&peer->p_routes, r_entry, troute)
-				wg_route_delete(&peer->p_sc->sc_routes, peer,
-						&route->r_cidr);
-
-		if (peer_io.p_flags & WG_PEER_HAS_PERSISTENTKEEPALIVE) {
-			peer->p_timers.t_persistent_keepalive_interval =
-					peer_io.p_persistentkeepalive;
-			if (peer_io.p_persistentkeepalive > 0)
-				wg_peer_send_keepalive(peer);
-		}
-
-		WG_CIDRS_FOREACH(_cidr_io, &peer_io) {
-			if ((ret = copyin(_cidr_io, &cidr_io,
-					  sizeof(cidr_io))) != 0)
-				return ret;
-
-			if ((ret = wg_route_add(&sc->sc_routes, peer,
-						&cidr_io)) != 0)
-				return ret;
-		}
-
-		wg_peer_put(peer);
-	}
-	return 0;
-}
-
-
-int
-wg_ioctl_get(struct wg_softc *sc, struct wg_device_io *dev)
-{
-	int i;
-	struct wg_peer *peer;
-	struct wg_route *route;
-	struct wg_peer_io peer_io, *_peer_io;
-	struct wg_cidr_io *_cidr_io;
-
-	dev->d_flags = 0;
-
-	if (sc->sc_local.l_has_identity) {
-		dev->d_flags |= WG_DEVICE_HAS_PUBKEY;
-		//TODO yes? dev->d_flags |= WG_PEER_HAS_MASKED_PRIVKEY;
-		memcpy(dev->d_pubkey, sc->sc_local.l_public, WG_KEY_SIZE);
-	}
-
-	if (sc->sc_socket.so_rdomain != 0) {
-		dev->d_flags |= WG_DEVICE_HAS_RDOMAIN;
-		dev->d_rdomain = sc->sc_socket.so_rdomain;
-	}
-
-	if (sc->sc_socket.so_port != 0) {
-		dev->d_flags |= WG_DEVICE_HAS_PORT;
-		dev->d_port = sc->sc_socket.so_port;
-	}
-
-	if (sc->sc_hashtable.h_num_peers > dev->d_num_peers ||
-	    sc->sc_routes.t_count > dev->d_num_cidrs) {
-		dev->d_num_peers = sc->sc_hashtable.h_num_peers;
-		dev->d_num_cidrs = sc->sc_routes.t_count;
-		return 0;
-	} else {
-		dev->d_num_peers = sc->sc_hashtable.h_num_peers;
-		dev->d_num_cidrs = sc->sc_routes.t_count;
-	}
-
-	_peer_io = dev->d_peers;
-	_cidr_io = dev->d_cidrs;
-
-	WG_HASHTABLE_PEER_FOREACH(peer, i, &sc->sc_hashtable) {
-
-		peer_io.p_flags = WG_DEVICE_HAS_PUBKEY;
-		memcpy(peer_io.p_pubkey, peer->p_remote.r_public, WG_KEY_SIZE);
-
-		if (bcmp(peer->p_remote.r_psk,
-					(uint8_t[WG_KEY_SIZE]) {0},
-					WG_KEY_SIZE) != 0) {
-			peer_io.p_flags |= WG_PEER_HAS_MASKED_SHAREDKEY;
-		}
-
-		rw_rlock(&peer->p_endpoint_lock);
-		if (peer->p_endpoint.e_remote.r_sa.sa_family != AF_UNSPEC) {
-			peer_io.p_flags |= WG_PEER_HAS_ENDPOINT;
-			/* TODO better sizeof? */
-			memcpy(&peer_io.p_sa, &peer->p_endpoint.e_remote,
-			    sizeof(peer->p_endpoint.e_remote));
-		}
-		rw_runlock(&peer->p_endpoint_lock);
-
-		if (peer->p_timers.t_persistent_keepalive_interval != 0) {
-			peer_io.p_flags |= WG_PEER_HAS_PERSISTENTKEEPALIVE;
-			peer_io.p_persistentkeepalive =
-				peer->p_timers.t_persistent_keepalive_interval;
-		}
-
-		peer_io.p_tx_bytes = counter_u64_fetch(peer->p_tx_bytes);
-		peer_io.p_rx_bytes = counter_u64_fetch(peer->p_rx_bytes);
-		wg_peer_timers_last_handshake(peer, &peer_io.p_last_handshake);
-		peer_io.p_cidrs = _cidr_io;
-		peer_io.p_num_cidrs = 0;
-
-		/* Copy out routes */
-		CK_LIST_FOREACH(route, &peer->p_routes, r_entry) {
-			if (copyout(&route->r_cidr, _cidr_io,
-				    sizeof(*_cidr_io)) != 0)
-				return EFAULT;
-			peer_io.p_num_cidrs++;
-			_cidr_io++;
-		}
-
-		/* Done with peer, next one now */
-		if (copyout(&peer_io, _peer_io, sizeof(*_peer_io)) != 0)
-			return EFAULT;
-		_peer_io++;
-	}
-	return 0;
-}
-
-#endif
 /*
  * XXX
  */
@@ -3482,31 +3297,3 @@ wg_peer_remove_all(struct wg_softc *sc)
 	}
 
 }
-
-int
-wg_clone_destroy(struct ifnet * ifp)
-{
-	struct wg_softc *sc = ifp->if_softc;
-
-
-
-	wg_socket_softclose(&sc->sc_socket);
-
-	if_detach(ifp);
-
-	//taskq_destroy(sc->sc_taskq);
-
-	if (wg_socket_close(&sc->sc_socket) != 0)
-		panic("unable to close wg_socket");
-
-	wg_hashtable_destroy(&sc->sc_hashtable);
-
-	/* Free structures */
-	wg_route_destroy(&sc->sc_routes);
-
-	DPRINTF(sc, "Interface destroyed\n");
-	free(sc, M_DEVBUF);
-
-	return (0);
-}
-
