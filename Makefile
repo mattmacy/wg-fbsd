@@ -15,7 +15,7 @@ KMOD=   if_wg
 
 CFLAGS+= -I${INCDIR}
 
-CFLAGS+= -D__KERNEL__ -D__BSD_VISIBLE=1
+CFLAGS+= -D__KERNEL__ -D__BSD_VISIBLE=1 -DINET6=1 -DINET=1
 CFLAGS+= -ferror-limit=5
 CFLAGS+= -include ${INCDIR}/sys/support.h
 
