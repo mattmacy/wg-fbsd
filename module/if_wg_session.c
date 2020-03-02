@@ -976,6 +976,7 @@ wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
 		tbl->t_count++;
 		CK_LIST_INSERT_HEAD(&peer->p_routes, route, r_entry);
 		route->r_cidr = *cidr;
+		route->r_peer = peer;
 	} else {
 		printf("need free of route\n");
 		needfree = true;
