@@ -137,7 +137,7 @@ void	wg_route_destroy(struct wg_route_table *);
 int	wg_route_add(struct wg_route_table *, struct wg_peer *,
 			     const struct wg_allowedip *);
 int	wg_route_delete(struct wg_route_table *, struct wg_peer *,
-				struct wg_allowedip *);
+				const struct wg_allowedip *);
 
 
 /* Hashtable */
@@ -927,8 +927,12 @@ wg_route_init(struct wg_route_table *tbl)
 void
 wg_route_destroy(struct wg_route_table *tbl)
 {
+	RADIX_NODE_HEAD_DESTROY(tbl->t_ip);
 	free(tbl->t_ip, M_RTABLE);
+#ifdef INET6
+	RADIX_NODE_HEAD_DESTROY(tbl->t_ip6);
 	free(tbl->t_ip6, M_RTABLE);
+#endif
 }
 
 int
@@ -939,15 +943,16 @@ wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
 	struct radix_node_head	*root;
 	struct wg_route *route;
 	sa_family_t family;
-	int mask = cidr->a_mask;
 	bool needfree = false;
+	struct sockaddr_storage mask;
+	struct sockaddr addr;
 
 	family = cidr->a_addr.sa_family;
+	mask = cidr->a_mask;
+	addr =cidr->a_addr;
 	if (family == AF_INET) {
-		MPASS(mask <= 32);
 		root = tbl->t_ip;
 	} else if (family == AF_INET6) {
-		MPASS(mask <= 128);
 		root = tbl->t_ip6;
 	} else {
 		printf("bad sa_family %d\n", cidr->a_addr.sa_family);
@@ -959,18 +964,17 @@ wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
 		return (ENOBUFS);
 	}
 	RADIX_NODE_HEAD_LOCK(root);
-	node = root->rnh_addaddr(__DECONST(void *, &cidr->a_addr), &mask, &root->rh,
+	node = root->rnh_addaddr(&addr, &mask, &root->rh,
 							&route->r_node);
 #ifdef INVARIANTS
 	struct radix_node	*matchnode;
-	matchnode = root->rnh_matchaddr(__DECONST(void *, &cidr->a_addr), &root->rh);
+	matchnode = root->rnh_matchaddr(&addr, &root->rh);
 	MPASS(matchnode == node);
 	printf("node matched in matchaddr\n");
 #endif
 	if (node == &route->r_node) {
 		tbl->t_count++;
 		CK_LIST_INSERT_HEAD(&peer->p_routes, route, r_entry);
-		route->r_peer = wg_peer_ref(peer);
 		route->r_cidr = *cidr;
 	} else {
 		printf("need free of route\n");
@@ -986,7 +990,7 @@ wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
 
 int
 wg_route_delete(struct wg_route_table *tbl, struct wg_peer *peer,
-		struct wg_allowedip *cidr)
+		const struct wg_allowedip *cidr)
 {
 	int ret = 0;
 	struct radix_node	*node;
@@ -994,6 +998,12 @@ wg_route_delete(struct wg_route_table *tbl, struct wg_peer *peer,
 	struct wg_route *route = NULL;
 	bool needfree = false;
 	sa_family_t family;
+	struct sockaddr_storage mask;
+	struct sockaddr addr;
+
+	family = cidr->a_addr.sa_family;
+	mask = cidr->a_mask;
+	addr = cidr->a_addr;
 
 	family = cidr->a_addr.sa_family;
 	if (family == AF_INET)
@@ -1003,12 +1013,11 @@ wg_route_delete(struct wg_route_table *tbl, struct wg_peer *peer,
 	else
 		return EINVAL;
 
-
 	RADIX_NODE_HEAD_LOCK(root);
-	if ((node = root->rnh_matchaddr(&cidr->a_addr, &root->rh)) != NULL) {
+	if ((node = root->rnh_matchaddr(&addr, &root->rh)) != NULL) {
 
-		if (root->rnh_deladdr(&cidr->a_addr, &cidr->a_mask, &root->rh) == NULL)
-			panic("art_delete failed to delete node %p", node);
+		if (root->rnh_deladdr(&addr, &mask, &root->rh) == NULL)
+			panic("del_addr failed to delete node %p", node);
 
 		/* We can type alias as node is the first elem in route */
 		route = (struct wg_route *) node;
@@ -1016,7 +1025,6 @@ wg_route_delete(struct wg_route_table *tbl, struct wg_peer *peer,
 		if (route->r_peer == peer) {
 			tbl->t_count--;
 			CK_LIST_REMOVE(route, r_entry);
-			wg_peer_put(route->r_peer);
 			needfree = true;
 		} else {
 			ret = EHOSTUNREACH;
@@ -2195,7 +2203,17 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 			printf("route add %d failed -> %d\n", i, err);
 		}
 	}
+#ifdef INVARIANTS
+	aip = wpci->wpci_allowedip_list;
+	for (int i = 0; i < wpci->wpci_allowedip_count; i++, aip++) {
+		err = wg_route_delete(&sc->sc_routes, peer, aip);
+		MPASS(err == 0);
+		if ((err = wg_route_add(&sc->sc_routes, peer, aip)) != 0) {
+			printf("route add %d failed -> %d\n", i, err);
+		}
+	}
 
+#endif	
 	dev = iflib_get_dev(sc->wg_ctx);
 	peer->p_id = atomic_fetchadd_long(&peer_counter, 1);
 

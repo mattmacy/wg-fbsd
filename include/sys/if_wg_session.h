@@ -53,7 +53,7 @@
 
 struct wg_allowedip {
 	struct sockaddr a_addr;
-	int a_mask;
+	struct sockaddr_storage a_mask;
 };
 
 enum {
@@ -61,25 +61,6 @@ enum {
 	WG_PEER_CTR_RX_BYTES,
 	WG_PEER_CTR_NUM,
 };
-
-#if 0
-struct wg_peer_io {
-	uint8_t			 p_flags;
-	uint8_t			 p_pubkey[WG_KEY_SIZE];
-	uint8_t			 p_sharedkey[WG_KEY_SIZE];
-	uint16_t		 p_persistentkeepalive;
-	size_t			 p_num_cidrs;
-	struct timespec		 p_last_handshake;
-	struct wg_cidr_io	*p_cidrs;
-	uint64_t	p_tx_bytes;
-	uint64_t	p_rx_bytes;
-	union {
-		struct sockaddr		p_sa;
-		struct sockaddr_in	p_in;
-		struct sockaddr_in6	p_in6;
-	};
-};
-#endif
 
 struct wg_device_io {
 	char			 d_name[IFNAMSIZ];
