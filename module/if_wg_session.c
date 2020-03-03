@@ -414,6 +414,7 @@ wg_socket_init(struct wg_softc *sc)
 	
 	rc = socreate(AF_INET6, &so->so_so6, SOCK_DGRAM, IPPROTO_UDP, td->td_ucred, td);
 	if (rc) {
+		SOCK_LOCK(so->so_so4);
 		sofree(so->so_so4);
 		return (rc);
 	}
@@ -433,11 +434,15 @@ wg_socket_reinit(struct wg_softc *sc, struct socket *new4,
 
 	so = &sc->sc_socket;
 
-	if (so->so_so4)
+	if (so->so_so4) {
+		SOCK_LOCK(so->so_so4);
 		sofree(so->so_so4);
+	}
 	so->so_so4 = new4;
-	if (so->so_so6)
+	if (so->so_so6) {
+		SOCK_LOCK(so->so_so6);
 		sofree(so->so_so6);
+	}
 	so->so_so6 = new6;
 }
 
