@@ -937,48 +937,38 @@ wg_route_destroy(struct wg_route_table *tbl)
 
 int
 wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
-			 const struct wg_allowedip *cidr)
+			 const struct wg_allowedip *cidr_)
 {
 	struct radix_node	*node;
 	struct radix_node_head	*root;
 	struct wg_route *route;
 	sa_family_t family;
+	struct wg_allowedip *cidr;
 	bool needfree = false;
-	struct sockaddr_storage mask;
-	struct sockaddr addr;
 
-	family = cidr->a_addr.sa_family;
-	mask = cidr->a_mask;
-	addr =cidr->a_addr;
+	family = cidr_->a_addr.sa_family;
 	if (family == AF_INET) {
 		root = tbl->t_ip;
 	} else if (family == AF_INET6) {
 		root = tbl->t_ip6;
 	} else {
-		printf("bad sa_family %d\n", cidr->a_addr.sa_family);
+		printf("bad sa_family %d\n", cidr_->a_addr.sa_family);
 		return (EINVAL);
 	}
-	route = malloc(sizeof(*route), M_WG, M_NOWAIT|M_ZERO);
-	if (__predict_false(route == NULL)) {
-		printf("route allocate failed\n");
-		return (ENOBUFS);
-	}
+	route = malloc(sizeof(*route), M_WG, M_WAITOK|M_ZERO);
+	route->r_cidr = *cidr_;
+	route->r_peer = peer;
+	cidr = &route->r_cidr;
+
 	RADIX_NODE_HEAD_LOCK(root);
-	node = root->rnh_addaddr(&addr, &mask, &root->rh,
-							&route->r_node);
-#ifdef INVARIANTS
-	struct radix_node	*matchnode;
-	matchnode = root->rnh_matchaddr(&addr, &root->rh);
-	MPASS(matchnode == node);
-	printf("node matched in matchaddr\n");
-#endif
-	if (node == &route->r_node) {
+	node = root->rnh_addaddr(&cidr->a_addr, &cidr->a_mask, &root->rh,
+							route->r_nodes);
+	if (node == route->r_nodes) {
 		tbl->t_count++;
 		CK_LIST_INSERT_HEAD(&peer->p_routes, route, r_entry);
-		route->r_cidr = *cidr;
-		route->r_peer = peer;
 	} else {
 		printf("need free of route\n");
+
 		needfree = true;
 	}
 	RADIX_NODE_HEAD_UNLOCK(root);
@@ -999,7 +989,7 @@ wg_route_delete(struct wg_route_table *tbl, struct wg_peer *peer,
 	struct wg_route *route = NULL;
 	bool needfree = false;
 	sa_family_t family;
-	struct sockaddr_storage mask;
+	struct sockaddr mask;
 	struct sockaddr addr;
 
 	family = cidr->a_addr.sa_family;
@@ -2204,7 +2194,19 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 			printf("route add %d failed -> %d\n", i, err);
 		}
 	}
+
 #ifdef INVARIANTS
+	struct radix_node	*matchnode;
+	struct radix_node_head	*root;
+	struct sockaddr addr;
+	struct wg_route *route;
+
+	root = sc->sc_routes.t_ip;
+	addr = wpci->wpci_allowedip_list[0].a_addr;
+	matchnode = root->rnh_matchaddr(&addr, &root->rh);
+	route = (void *)matchnode;
+	MPASS(route->r_peer == peer);
+
 	aip = wpci->wpci_allowedip_list;
 	for (int i = 0; i < wpci->wpci_allowedip_count; i++, aip++) {
 		err = wg_route_delete(&sc->sc_routes, peer, aip);
@@ -2213,7 +2215,6 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 			printf("route add %d failed -> %d\n", i, err);
 		}
 	}
-
 #endif	
 	dev = iflib_get_dev(sc->wg_ctx);
 	peer->p_id = atomic_fetchadd_long(&peer_counter, 1);

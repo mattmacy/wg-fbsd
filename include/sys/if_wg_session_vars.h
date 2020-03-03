@@ -212,10 +212,10 @@ struct wg_route_table {
 };
 
 struct wg_route {
-	struct radix_node		 r_node;
+	struct radix_node		 r_nodes[2];
 	CK_LIST_ENTRY(wg_route)	 r_entry;
-	struct wg_allowedip		 r_cidr;
 	struct wg_peer		*r_peer;
+	struct wg_allowedip		 r_cidr;
 };
 
 /* Noise */
