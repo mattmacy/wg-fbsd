@@ -71,11 +71,6 @@ MALLOC_DEFINE(M_WG, "WG", "wireguard");
 
 static int clone_count;
 
-struct nvlist_desc {
-	caddr_t nd_data;
-	u_long nd_len;
-};
-
 static int
 wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t params)
 {
@@ -155,6 +150,7 @@ wg_transmit(struct ifnet *ifp, struct mbuf *m)
 	struct wg_peer *peer;
 	int rc;
 
+	printf("%s(%p, %p)\n", __func__, ifp, m);
 	rc = 0;
 	sc = iflib_get_softc(ifp->if_softc);
 	ETHER_BPF_MTAP(ifp, m);
@@ -193,6 +189,12 @@ err:
 
 
 static int
+wg_output(struct ifnet *ifp, struct mbuf *m, const struct sockaddr *sa, struct route *rt)
+{
+	return (wg_transmit(ifp, m));
+}
+
+static int
 wg_attach_post(if_ctx_t ctx)
 {
 	struct ifnet *ifp;
@@ -200,14 +202,22 @@ wg_attach_post(if_ctx_t ctx)
 
 	sc = iflib_get_softc(ctx);
 	ifp = iflib_get_ifp(ctx);
-	//if_setmtu(ifp, ETHERMTU - 50);
+	if_setmtu(ifp, ETHERMTU - 50);
 	/* XXX do sokect_init */
-	ifp->if_transmit = wg_transmit; 
+	ifp->if_transmit = wg_transmit;
+	ifp->if_output = wg_output;
 	//CK_LIST_INIT(&sc->wg_peer_list);
 	//mtx_init(&sc->wg_socket_lock, "sock lock", NULL, MTX_DEF);
 
 	wg_hashtable_init(&sc->sc_hashtable);
 	wg_route_init(&sc->sc_routes);
+
+	return (0);
+}
+
+static int
+wg_mtu_set(if_ctx_t ctx, uint32_t mtu)
+{
 
 	return (0);
 }
@@ -535,6 +545,7 @@ static device_method_t wg_if_methods[] = {
 	DEVMETHOD(ifdi_init, wg_init),
 	DEVMETHOD(ifdi_stop, wg_stop),
 	DEVMETHOD(ifdi_priv_ioctl, wg_priv_ioctl),
+	DEVMETHOD(ifdi_mtu_set, wg_mtu_set),
 	DEVMETHOD_END
 };
 
