@@ -204,6 +204,8 @@ wg_attach_post(if_ctx_t ctx)
 	ifp = iflib_get_ifp(ctx);
 	if_setmtu(ifp, ETHERMTU - 50);
 	/* XXX do sokect_init */
+
+	if_setflagbits(ifp, 0, IFF_POINTOPOINT);
 	ifp->if_transmit = wg_transmit;
 	ifp->if_output = wg_output;
 	//CK_LIST_INIT(&sc->wg_peer_list);
@@ -240,14 +242,17 @@ wg_detach(if_ctx_t ctx)
 static void
 wg_init(if_ctx_t ctx)
 {
+	struct ifnet *ifp;
 	struct wg_softc *sc;
 	//struct wg_peer *peer;
 	int rc;
 
 	sc = iflib_get_softc(ctx);
+	ifp = iflib_get_ifp(ctx);
 	rc = wg_socket_init(sc);
 	if (rc)
 		return;
+	if_link_state_change(ifp, LINK_STATE_UP);
 	/*
 	CK_STAILQ_FOREACH(&sc->wg_peer_list, ...) {
 		wg_pkt_staged_tx(peer);
@@ -261,8 +266,11 @@ static void
 wg_stop(if_ctx_t ctx)
 {
 	struct wg_softc *sc;
+	struct ifnet *ifp;
 
 	sc  = iflib_get_softc(ctx);
+	ifp = iflib_get_ifp(ctx);
+	if_link_state_change(ifp, LINK_STATE_DOWN);
 	/*
 	CK_LIST_FOREACH(&sc->wg_peer_list, ...) {
 		wg_staged_pktq_purge(peer);
