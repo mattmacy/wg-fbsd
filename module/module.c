@@ -80,6 +80,7 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	struct iovec iov;
 	nvlist_t *nvl;
 	void *packed;
+	struct noise_local *local;
 	int err;
 	uint16_t listen_port;
 	const void *key;
@@ -122,9 +123,11 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	}
 
 	sc->sc_socket.so_port = listen_port;
-	memcpy(sc->sc_local.l_private, key, size);
-	curve25519_clamp_secret(sc->sc_local.l_private);
-	curve25519_generate_public(sc->sc_local.l_public, key);
+	local = &sc->sc_local;
+	memcpy(local->l_private, key, size);
+	rw_init(&local->l_lock, "local key lock");
+	curve25519_clamp_secret(local->l_private);
+	local->l_has_identity = curve25519_generate_public(local->l_public, key);
 
 	atomic_add_int(&clone_count, 1);
 	scctx = sc->shared = iflib_get_softc_ctx(ctx);
@@ -159,6 +162,7 @@ wg_transmit(struct ifnet *ifp, struct mbuf *m)
 	peer = wg_route_lookup(&sc->sc_routes, m, OUT);
 	if (__predict_false(peer == NULL)) {
 		rc = ENOKEY;
+		printf("peer not found\n");
 		/* XXX log */
 		goto err;
 	}
@@ -233,7 +237,7 @@ wg_detach(if_ctx_t ctx)
 	//sc->wg_accept_port = 0;
 	wg_socket_reinit(sc, NULL, NULL);
 	wg_peer_remove_all(sc);
-	
+	rw_destroy(&sc->sc_local.l_lock);
 	atomic_add_int(&clone_count, -1);
 
 	return (0);
