@@ -92,7 +92,7 @@ int		wg_counter_validate(struct wg_counter *, uint64_t);
 /* Socket */
 void	wg_socket_softclose(struct wg_socket *);
 int	wg_socket_close(struct wg_socket *);
-int	wg_socket_bind(struct wg_socket *);
+static int	wg_socket_bind(struct wg_softc *sc, struct wg_socket *);
 int	wg_socket_port_set(struct wg_socket *, in_port_t);
 int	wg_socket_rdomain_set(struct wg_socket *, uint8_t);
 int	wg_socket_send_mbuf(struct wg_socket *, struct mbuf *, uint16_t);
@@ -393,18 +393,54 @@ invalid:
 
 /* Socket */
 
+static int
+wg_socket_reuse(struct wg_softc *sc, struct socket *so)
+{
+	struct sockopt sopt;
+	int error, val = 1;
+	struct ifnet *ifp;
+
+	bzero(&sopt, sizeof(sopt));
+	sopt.sopt_dir = SOPT_SET;
+	sopt.sopt_level = SOL_SOCKET;
+	sopt.sopt_name = SO_REUSEPORT;
+	sopt.sopt_val = &val;
+	sopt.sopt_valsize = sizeof(val);
+	error = sosetopt(so, &sopt);
+	if (error) {
+		ifp = iflib_get_ifp(sc->wg_ctx);
+		if_printf(ifp,
+				  "cannot set REUSEPORT socket opt: %d\n", error);
+	}
+	sopt.sopt_name = SO_REUSEADDR;
+	error = sosetopt(so, &sopt);
+	if (error) {
+		ifp = iflib_get_ifp(sc->wg_ctx);
+		if_printf(ifp,
+				  "cannot set REUSEADDDR socket opt: %d\n", error);
+	}
+	return (error);
+}
+
 int
 wg_socket_init(struct wg_softc *sc)
 {
 	struct thread *td;
 	struct wg_socket *so;
+	struct ifnet *ifp;
 	int rc;
 
 	so = &sc->sc_socket;
 	td = curthread;
+	ifp = iflib_get_ifp(sc->wg_ctx);
 	rc = socreate(AF_INET, &so->so_so4, SOCK_DGRAM, IPPROTO_UDP, td->td_ucred, td);
-	if (rc)
+	if (rc) {
+		if_printf(ifp, "can't create AF_INET socket\n");
 		return (rc);
+	}
+	rc = wg_socket_reuse(sc, so->so_so4);
+	if (rc)
+		goto fail;
 	rc = udp_set_kernel_tunneling(so->so_so4, wg_input, NULL, sc);
 	/*
 	 * udp_set_kernel_tunneling can only fail if there is already a tunneling function set.
@@ -414,17 +450,26 @@ wg_socket_init(struct wg_softc *sc)
 	
 	rc = socreate(AF_INET6, &so->so_so6, SOCK_DGRAM, IPPROTO_UDP, td->td_ucred, td);
 	if (rc) {
-		SOCK_LOCK(so->so_so4);
-		sofree(so->so_so4);
-		return (rc);
+		if_printf(ifp, "can't create AF_INET6 socket\n");
+
+		goto fail;
+	}
+	rc = wg_socket_reuse(sc, so->so_so6);
+	if (rc) {
+		SOCK_LOCK(so->so_so6);
+		sofree(so->so_so6);
+		goto fail;
 	}
 	rc = udp_set_kernel_tunneling(so->so_so6, wg_input, NULL, sc);
 	MPASS(rc == 0);
 
-	rc = wg_socket_bind(so);
+	rc = wg_socket_bind(sc, so);
+	return (rc);
+fail:
+	SOCK_LOCK(so->so_so4);
+	sofree(so->so_so4);
 	return (rc);
 }
-
 
 void
 wg_socket_reinit(struct wg_softc *sc, struct socket *new4,
@@ -470,26 +515,28 @@ union wg_sockaddr {
 };
 
 int
-wg_socket_bind(struct wg_socket *so)
+wg_socket_bind(struct wg_softc *sc, struct wg_socket *so)
 {
 	int rc;
 	struct thread *td;
 	union wg_sockaddr laddr;
 	struct sockaddr_in *sin;
 	struct sockaddr_in6 *sin6;
+	struct ifnet *ifp;
 
 	td = curthread;
 	bzero(&laddr, sizeof(laddr));
-
+	ifp = iflib_get_ifp(sc->wg_ctx);
 	sin = &laddr.in4;
 	sin->sin_len = sizeof(laddr.in4);
 	sin->sin_family = AF_INET;
 	sin->sin_port = htons(so->so_port);
 	sin->sin_addr = (struct in_addr) { 0 };
 
-	if ((rc = sobind(so->so_so4, &laddr.sa, td)) != 0)
+	if ((rc = sobind(so->so_so4, &laddr.sa, td)) != 0) {
+		if_printf(ifp, "can't bind AF_INET socket %d\n", rc);
 		return (rc);
-
+	}
 	sin6 = &laddr.in6;
 	sin6->sin6_len = sizeof(laddr.in6);
 	sin6->sin6_family = AF_INET6;
@@ -497,10 +544,11 @@ wg_socket_bind(struct wg_socket *so)
 	sin6->sin6_addr = (struct in6_addr) { .s6_addr = { 0 } };
 
 	rc = sobind(so->so_so6, &laddr.sa, td);
-
+	if (rc)
+		if_printf(ifp, "can't bind AF_INET6 socket %d\n", rc);
 	return (rc);
 }
-
+#if 0
 int
 wg_socket_port_set(struct wg_socket *so, in_port_t port)
 {
@@ -522,7 +570,7 @@ wg_socket_rdomain_set(struct wg_socket *so, uint8_t rdomain)
 	mtx_unlock(&so->so_mtx);
 	return ret;
 }
-
+#endif
 int
 wg_socket_send_mbuf(struct wg_socket *so, struct mbuf *m, uint16_t family)
 {
@@ -966,6 +1014,8 @@ wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
 	cidr = &route->r_cidr;
 
 	RADIX_NODE_HEAD_LOCK(root);
+	printf("addaddr(%16D, %16D)\n",
+		   &cidr->a_addr, ":", &cidr->a_mask, ":");
 	node = root->rnh_addaddr(&cidr->a_addr, &cidr->a_mask, &root->rh,
 							route->r_nodes);
 	if (node == route->r_nodes) {
@@ -1047,6 +1097,8 @@ wg_route_lookup(struct wg_route_table *tbl, struct mbuf *m,
 	struct radix_node_head *root;
 	struct radix_node	*node;
 	struct wg_peer	*peer = NULL;
+	struct sockaddr_in sin;
+	struct sockaddr_in6 sin6;
 	void *addr;
 	int version;
 
@@ -1059,19 +1111,29 @@ wg_route_lookup(struct wg_route_table *tbl, struct mbuf *m,
 
 	if (version == 4) {
 		root = tbl->t_ip;
+		memset(&sin, 0, sizeof(sin));
+		sin.sin_len = sizeof(struct sockaddr_in);
 		if (dir == IN)
-			addr = &iphdr->ip_src;
+			sin.sin_addr = iphdr->ip_src;
 		else
-			addr = &iphdr->ip_dst;
+			sin.sin_addr = iphdr->ip_dst;
+		addr = &sin;
 	} else if (version == 6) {
 		ip6hdr = mtod(m, struct ip6_hdr *);
+		memset(&sin6, 0, sizeof(sin6));
+		sin6.sin6_len = sizeof(struct sockaddr_in6);
+
 		root = tbl->t_ip6;
 		if (dir == IN)
 			addr = &ip6hdr->ip6_src;
 		else
 			addr = &ip6hdr->ip6_dst;
+		memcpy(&sin6.sin6_addr, addr, sizeof(sin6.sin6_addr));
+		addr = &sin6;
 	} else
 		return (NULL);
+	printf("matchaddr(%16D)\n",
+		   addr, ":");
 
 	RADIX_NODE_HEAD_RLOCK(root);
 	if ((node = root->rnh_matchaddr(addr, &root->rh)) != NULL) {
@@ -1657,9 +1719,10 @@ noise_handshake_create_initiation(struct wg_pkt_initiation *dst,
 	if ((keypair = noise_keypair_create()) == NULL)
 		goto out;
 
-	if (!local->l_has_identity)
+	if (!local->l_has_identity) {
+		printf("%s doesn't have identity\n", __func__);
 		goto out;
-
+	}
 	noise_param_init(keypair->k_chaining_key, keypair->k_hash,
 			peer->p_remote.r_public);
 
@@ -2234,7 +2297,7 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	noise_keypairs_init(&peer->p_keypairs);
 
 	rw_init(&peer->p_endpoint_lock, "wg_peer_endpoint");
-
+	mtx_init(&peer->p_lock, "peer lock", NULL, MTX_DEF);
 	bzero(&peer->p_endpoint, sizeof(peer->p_endpoint));
 	memcpy(&peer->p_endpoint.e_remote, wpci->wpci_endpoint,
 			    sizeof(peer->p_endpoint.e_remote));
@@ -2325,6 +2388,7 @@ wg_peer_free(epoch_context_t ctx)
 	counter_u64_free(peer->p_rx_bytes);
 
 	DPRINTF(peer->p_sc, "Peer %lu destroyed\n", peer->p_id);
+	mtx_destroy(&peer->p_lock);
 	zfree(peer, M_WG);
 }
 
@@ -3314,11 +3378,13 @@ void
 wg_peer_remove_all(struct wg_softc *sc)
 {
 	struct wg_peer *peer, *tpeer;
-	int i;
+	struct epoch_tracker et;
 
-	WG_HASHTABLE_PEER_FOREACH_SAFE(peer, i, &sc->sc_hashtable, tpeer) {
+	NET_EPOCH_ENTER(et);
+	CK_LIST_FOREACH_SAFE(peer, &sc->sc_hashtable.h_peers_list,
+	    p_entry, tpeer) {
 		peer = wg_peer_ref(peer);
 		wg_peer_destroy(&peer);
 	}
-
+	NET_EPOCH_EXIT(et);
 }
