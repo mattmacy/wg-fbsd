@@ -309,6 +309,15 @@ callout_del(struct callout *c)
 	return (callout_stop(c) > 0);
 }
 
+static inline void
+wg_m_freem_(struct mbuf *m, char *file, int line)
+{
+	printf("freeing m=%p at %s:%d\n", m, file, line);
+	m_freem(m);
+}
+
+#define wg_m_freem(m) wg_m_freem_((m), __FILE__, __LINE__)
+
 static const uint8_t handshake_name[37] = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 static const uint8_t identifier_name[30] = "WireGuard v1 FreeBSD.org";
 static __read_mostly uint8_t handshake_init_hash[NOISE_HASH_LEN];
@@ -574,24 +583,24 @@ wg_socket_rdomain_set(struct wg_socket *so, uint8_t rdomain)
 int
 wg_socket_send_mbuf(struct wg_socket *so, struct mbuf *m, uint16_t family)
 {
-#if 0
 	int err;
+	struct inpcb *inp;
 
 	switch (family) {
-	case AF_INET:
-		err = ip_output(m, NULL, NULL, IP_RAWOUTPUT, NULL, NULL, 0);
+		case AF_INET:
+			inp = sotoinpcb(so->so_so4);
+			err = ip_output(m, NULL, NULL, IP_RAWOUTPUT, NULL, inp);
 		break;
 	case AF_INET6:
-		err = ip6_output(m, 0, NULL, IPV6_MINMTU, 0, NULL);
+			inp = sotoinpcb(so->so_so6);
+			err = ip6_output(m, NULL, NULL, IPV6_MINMTU, NULL, NULL, inp);
 		break;
 	default:
-		m_freem(m);
+		wg_m_freem(m);
 		err = EAFNOSUPPORT;
 	}
 
 	return err;
-#endif
-	return (0);
 }
 
 int
@@ -606,7 +615,7 @@ wg_socket_send_buffer(struct wg_socket *so, void *buf, size_t len,
 	m_copyback(m, 0, len, buf);
 
 	if ((err = wg_mbuf_add_ipudp(&m, so, dst)) != 0) {
-		m_freem(m);
+		wg_m_freem(m);
 		return err;
 	}
 
@@ -2413,12 +2422,13 @@ void
 wg_peer_send_handshake_initiation(struct wg_peer *peer)
 {
 	struct wg_pkt_initiation init;
+	struct epoch_tracker et;
 
 	rw_wlock(&peer->p_timers.t_lock);
 	if (!wg_timers_expired(&peer->p_timers.t_last_sent_handshake,
 				REKEY_TIMEOUT, 0)) {
 		rw_wunlock(&peer->p_timers.t_lock);
-		goto leave; /* This function is rate limited. */
+		return;
 	}
 	getnanotime(&peer->p_timers.t_last_sent_handshake);
 	rw_wunlock(&peer->p_timers.t_lock);
@@ -2426,6 +2436,7 @@ wg_peer_send_handshake_initiation(struct wg_peer *peer)
 	DPRINTF(peer->p_sc, "Sending handshake initiation to peer %lu\n",
 			peer->p_id);
 
+	NET_EPOCH_ENTER(et);
 	if (noise_handshake_create_initiation(&init, peer) == 0) {
 		wg_cookie_add_mac_to_packet(&peer->p_cookie, &init,
 					    sizeof(init));
@@ -2435,8 +2446,7 @@ wg_peer_send_handshake_initiation(struct wg_peer *peer)
 		wg_peer_enqueue_buffer(peer, &init, sizeof(init));
 		wg_peer_timers_handshake_initiated(peer);
 	}
-leave:
-	wg_peer_put(peer);
+	NET_EPOCH_EXIT(et);
 }
 
 void
@@ -2512,22 +2522,22 @@ wg_peer_mbuf_add_ipudp(struct wg_peer *peer, struct mbuf **m)
 void
 wg_peer_send(struct wg_peer *peer)
 {
-	UNIMPLEMENTED();
-#if 0
-	struct mbuf *m;
 	struct wg_queue_pkt *pkt;
+	struct mbuf *m;
 
-	while ((pkt = wg_queue_serial_dequeue(&peer->p_send_queue)) != NULL) {
+	while ((pkt = wg_pktq_serial_dequeue(&peer->p_send_queue)) != NULL) {
 		m = pkt->p_pkt;
 		if (pkt->p_state == WG_PKT_STATE_CRYPTED) {
+			struct wg_endpoint *e = wg_mbuf_endpoint_get(m);
+			sa_family_t type = e->e_remote.r_sa.sa_family;
+
 			counter_u64_add(peer->p_tx_bytes, m->m_pkthdr.len);
-			//wg_socket_send_mbuf(&peer->p_sc->sc_socket, m, XXX);
+			MPASS(type == AF_INET || type == AF_INET6);
+			wg_socket_send_mbuf(&peer->p_sc->sc_socket, m, type);
 		} else {
-			m_freem(m);
+			wg_m_freem(m);
 		}
 	}
-	wg_peer_put(peer);
-#endif
 }
 
 void
@@ -2555,9 +2565,9 @@ wg_peer_recv(struct wg_peer *peer)
 			else if (version == 6)
 				ip6_input(m);
 			else
-				m_freem(m);
+				wg_m_freem(m);
 		} else {
-			m_freem(m);
+			wg_m_freem(m);
 		}
 	}
 	wg_peer_put(peer);
@@ -2574,13 +2584,16 @@ wg_peer_enqueue_buffer(struct wg_peer *peer, void *buf, size_t len)
 	m_copyback(m, 0, len, buf);
 
 	if (wg_peer_mbuf_add_ipudp(peer, &m) != 0) {
-		m_freem(m);
+		wg_m_freem(m);
 		return;
 	}
 
+	MPASS(m->m_len > 0);
+	MPASS(m->m_pkthdr.len > 0);
 	pkt = wg_mbuf_pkt_get(m);
 	pkt->p_state = WG_PKT_STATE_CRYPTED;
 
+	printf("enqueueing %p for mbuf %p\n", pkt, m);
 	wg_pktq_serial_enqueue(&peer->p_send_queue, pkt);
 	wg_pktq_pkt_done(pkt);
 	GROUPTASK_ENQUEUE(&peer->p_send);
@@ -2645,7 +2658,7 @@ wg_peer_send_staged_packets(struct wg_peer *peer)
 		pkt->p_nonce = wg_counter_next(&keypair->k_counter);
 
 		if (pkt->p_nonce >= REJECT_AFTER_MESSAGES) {
-			m_freem(m);
+			wg_m_freem(m);
 			goto invalid;
 		}
 
@@ -2739,6 +2752,7 @@ wg_mbuf_pkt_get(struct mbuf *m)
 {
 	struct m_dat_hdr *hdr;
 	struct wg_endpoint *wend;
+	struct wg_queue_pkt *pkt;
 
 	MPASS(m->m_flags & M_PKTHDR);
 	if ((m->m_flags  & M_EXT) == 0) {
@@ -2757,14 +2771,21 @@ wg_mbuf_pkt_get(struct mbuf *m)
 		m->m_flags |= M_DAT_INUSE;
 		hdr->mdh_types[0] = M_DAT_TYPE_QPKT;
 		hdr->mdh_types[1] = M_DAT_TYPE_UNUSED;
+		pkt = (struct wg_queue_pkt *)(hdr +1);
+		bzero(pkt, sizeof(*pkt));
+		pkt->p_pkt = m;
 	}
 	switch (hdr->mdh_types[0]) {
 		case M_DAT_TYPE_QPKT:
 			return (struct wg_queue_pkt *)(hdr +1);
 		case M_DAT_TYPE_ENDPOINT:
 			wend = (struct wg_endpoint *)(hdr +1);
-			if (hdr->mdh_types[1] == M_DAT_TYPE_UNUSED)
+			if (hdr->mdh_types[1] == M_DAT_TYPE_UNUSED) {
 				hdr->mdh_types[1] = M_DAT_TYPE_QPKT;
+				pkt = (struct wg_queue_pkt *)(wend +1);
+				bzero(pkt, sizeof(*pkt));
+				pkt->p_pkt = m;
+			}
 			return (struct wg_queue_pkt *)(wend +1);
 		default:
 			panic("invalid M_DAT type");
@@ -2789,11 +2810,12 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 	struct in6_addr laddr6;
 	in_port_t rport;
 
-
+	MPASS(len > 0);
+	MPASS(m->m_len > 0);
 	td = curthread;
 	if (e->e_remote.r_sa.sa_family == AF_INET) {
 		m = m_prepend(m, sizeof(*ip4) + sizeof(*udp), M_WAITOK);
-
+		m->m_pkthdr.flowid = AF_INET;
 		inp = sotoinpcb(so->so_so4);
 
 		ip4 = mtod(m, struct ip *);
@@ -2808,9 +2830,13 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 		ip4->ip_p	= IPPROTO_UDP;
 
 		if (e->e_local.l_in.s_addr == INADDR_ANY) {
-			rtfree(inp->inp_route.ro_rt);
-			inp->inp_route.ro_rt = NULL;
+			if (inp->inp_route.ro_rt != NULL) {
+				rtfree(inp->inp_route.ro_rt);
+				inp->inp_route.ro_rt = NULL;
+			}
+			CURVNET_SET(inp->inp_vnet);
 			err = in_pcbladdr(inp, &e->e_remote.r_sin.sin_addr, &laddr4, td->td_ucred);
+			CURVNET_RESTORE();
 			if (err != 0)
 				return err;
 
@@ -2825,6 +2851,7 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 
 	} else if (e->e_remote.r_sa.sa_family == AF_INET6) {
 		m = m_prepend(m, sizeof(*ip6) + sizeof(*udp), M_WAITOK);
+		m->m_pkthdr.flowid = AF_INET;
 
 		inp = sotoinpcb(so->so_so6);
 
@@ -2972,7 +2999,7 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 
 	noise_keypair_put(keypair);
 free:
-	m_freem(m);
+	wg_m_freem(m);
 }
 #ifdef notyet
 struct wg_peer *
@@ -3017,7 +3044,7 @@ wg_queue_pkt_encrypt(struct wg_queue_pkt *pkt)
 	if (wg_peer_mbuf_add_ipudp(peer, &mc) == 0)
 		pkt->p_state = WG_PKT_STATE_CRYPTED;
 
-	m_freem(m);
+	wg_m_freem(m);
 	pkt->p_pkt = mc;
 
 	return peer;
@@ -3156,7 +3183,7 @@ wg_start(struct ifqueue *ifq)
 		if ((peer = wg_route_lookup(&sc->sc_routes, m, OUT)) == NULL) {
 
 			//if_inc_counter(sc->sc_ifp, ifc_oerrors);
-			m_freem(m);
+			wg_m_freem(m);
 			continue;
 		}
 
@@ -3185,7 +3212,7 @@ wg_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *sa,
 	struct wg_softc *sc = ifp->if_softc;
 
 	if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6) {
-		m_freem(m);
+		wg_m_freem(m);
 		if_inc_counter(sc->sc_ifp, IFCOUNTER_NOPROTO, 1);
 		DPRINTF(sc, "Invalid IP packet\n");
 		return EAFNOSUPPORT;
@@ -3200,7 +3227,7 @@ wg_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *sa,
 			icmp6_error(m, ICMP6_DST_UNREACH,
 				   ICMP6_DST_UNREACH_ADDR, 0);
 		} else {
-			m_freem(m);
+			wg_m_freem(m);
 		}
 		return ENETUNREACH;
 	}
@@ -3209,7 +3236,7 @@ wg_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *sa,
 	    peer->p_endpoint.e_remote.r_sa.sa_family != AF_INET6) {
 		DPRINTF(sc, "No valid endpoint has been configured or "
 				"discovered for peer %lu\n", peer->p_id);
-		m_freem(m);
+		wg_m_freem(m);
 		wg_peer_put(peer);
 		return EDESTADDRREQ;
 	}
@@ -3224,7 +3251,7 @@ wg_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *sa,
 			icmp6_error(m, ICMP6_DST_UNREACH,
 				    ICMP6_DST_UNREACH_ADDR, 0);
 		else
-			m_freem(m);
+			wg_m_freem(m);
 		wg_peer_put(peer);
 		return ELOOP;
 	}
@@ -3289,12 +3316,12 @@ wg_input(struct mbuf *m, int offset, struct inpcb *inpcb,
 
 		if (pkt->p_keypair == NULL) {
 			if_inc_counter(sc->sc_ifp, IFCOUNTER_IERRORS, 1);
-			m_freem(m);
+			wg_m_freem(m);
 		} else if (wg_pktq_parallel_len(
 				&sc->sc_decrypt_queue) > MAX_QUEUED_PACKETS) {
 			if_inc_counter(sc->sc_ifp, IFCOUNTER_IQDROPS, 1);
 			noise_keypair_put(pkt->p_keypair);
-			m_freem(m);
+			wg_m_freem(m);
 		} else {
 			wg_pktq_enqueue(&sc->sc_decrypt_queue,
 					&pkt->p_keypair->k_peer->p_recv_queue,
@@ -3304,7 +3331,7 @@ wg_input(struct mbuf *m, int offset, struct inpcb *inpcb,
 	} else {
 		DPRINTF(sc, "Invalid packet\n");
 free:
-		m_freem(m);
+		wg_m_freem(m);
 	}
 }
 /*
