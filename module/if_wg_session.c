@@ -59,6 +59,7 @@
 #include <crypto/blake2s.h>
 #include <crypto/curve25519.h>
 //#include <crypto/chachapoly.h>
+#include <machine/in_cksum.h>
 
 #define	GROUPTASK_DRAIN(gtask)			\
 	gtaskqueue_drain((gtask)->gt_taskqueue, &(gtask)->gt_task)
@@ -2835,7 +2836,6 @@ wg_mbuf_pkt_get(struct mbuf **m0)
 	return (NULL);
 }
 
-
 int
 wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 {
@@ -2851,6 +2851,7 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 	struct in_addr laddr4;
 	struct in6_addr laddr6;
 	in_port_t rport;
+	uint8_t  pr;
 
 	MPASS(len > 0);
 	MPASS(m->m_len > 0);
@@ -2870,7 +2871,7 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 		ip4->ip_len	= htons(sizeof(*ip4) + sizeof(*udp) + len);
 		//ip4->ip_id	= htons(ip_randomid());
 		ip4->ip_off	= 0;
-		// ip4->ip_ttl	= inp->inp_ip.ip_ttl;
+		ip4->ip_ttl	= 127;
 		ip4->ip_p	= IPPROTO_UDP;
 
 		if (e->e_local.l_in.s_addr == INADDR_ANY) {
@@ -2892,7 +2893,11 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 		rport		= e->e_remote.r_sin.sin_port;
 
 		udp = (struct udphdr *)(mtod(m, caddr_t) + sizeof(*ip4));
-
+		udp->uh_dport = rport;
+		udp->uh_ulen = htons(sizeof(*udp) + len);
+		pr  = inp->inp_socket->so_proto->pr_protocol;
+		udp->uh_sum =  in_pseudo(ip4->ip_src.s_addr, ip4->ip_dst.s_addr,
+		    htons((u_short)len + sizeof(struct udphdr) + pr));
 	} else if (e->e_remote.r_sa.sa_family == AF_INET6) {
 		m = m_prepend(m, sizeof(*ip6) + sizeof(*udp), M_WAITOK);
 		m->m_pkthdr.flowid = AF_INET;
@@ -2934,12 +2939,8 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 	}
 
 	m->m_flags &= ~(M_BCAST|M_MCAST);
-	m->m_pkthdr.csum_flags |= CSUM_UDP | CSUM_UDP_IPV6;
-
-	udp->uh_sport = inp->inp_lport;
-	udp->uh_dport = rport;
-	udp->uh_ulen = htons(sizeof(*udp) + len);
-	udp->uh_sum = 0;
+	m->m_pkthdr.csum_flags = CSUM_UDP | CSUM_UDP_IPV6;
+	m->m_pkthdr.csum_data = offsetof(struct udphdr, uh_sum);
 
 	*m0 = m;
 
