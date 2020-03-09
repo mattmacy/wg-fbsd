@@ -858,6 +858,11 @@ wg_peer_timers_init(struct wg_peer *peer)
 {
 	rw_init(&peer->p_timers.t_lock, "wg_peer_timers");
 
+	callout_init(&peer->p_timers.t_retransmit_handshake, true);
+	callout_init(&peer->p_timers.t_send_keepalive, true);
+	callout_init(&peer->p_timers.t_new_handshake, true);
+	callout_init(&peer->p_timers.t_zero_key_material, true);
+	callout_init(&peer->p_timers.t_persistent_keepalive, true);
 #if 0	
 	timeout_set_proc(&peer->p_timers.t_retransmit_handshake,
 	     (void (*)(void *))wg_peer_expired_retransmit_handshake, peer);
@@ -1370,10 +1375,9 @@ noise_keypair_attach_to_peer(struct noise_keypair *keypair,
 	mtx_lock(&keypair->k_mtx);
 
 	MPASS(keypair->k_peer == NULL);
-	keypair->k_peer = wg_peer_ref(peer);
+	keypair->k_peer = peer;
 	noise_keypairs_insert_new(&peer->p_keypairs, keypair);
 	wg_hashtable_keypair_insert(&peer->p_sc->sc_hashtable, keypair);
-
 	mtx_unlock(&keypair->k_mtx);
 
 	DPRINTF(keypair->k_peer->p_sc, "Keypair %lu created for peer %lu\n",
@@ -1408,7 +1412,9 @@ noise_keypair_destroy(struct noise_keypair **keypair_p)
 	*keypair_p = NULL;
 	wg_hashtable_keypair_remove(&keypair->k_peer->p_sc->sc_hashtable,
 	    keypair);
-	noise_keypair_put(keypair);
+
+	//NET_EPOCH_CALL(...)   XXX
+	//noise_keypair_put(keypair);
 }
 
 void
@@ -1416,7 +1422,6 @@ noise_keypair_free(struct noise_keypair *keypair)
 {
 	DPRINTF(keypair->k_peer->p_sc, "Keypair %lu destroyed\n",
 		keypair->k_id);
-	wg_peer_put(keypair->k_peer);
 	zfree(keypair, M_WG);
 }
 
@@ -1747,7 +1752,7 @@ noise_handshake_create_initiation(struct wg_pkt_initiation *dst,
 	struct noise_local *local = &peer->p_sc->sc_local;
 	struct noise_keypair *keypair;
 
-	rw_rlock(&local->l_lock);
+	NET_EPOCH_ASSERT();
 
 	if ((keypair = noise_keypair_create()) == NULL)
 		goto out;
@@ -1796,7 +1801,6 @@ noise_handshake_create_initiation(struct wg_pkt_initiation *dst,
 	dst->header.type = WG_PKT_INITIATION;
 	dst->sender_index = keypair->k_local_index;
 out:
-	rw_runlock(&local->l_lock);
 	explicit_bzero(ss, WG_KEY_SIZE);
 	explicit_bzero(key, WG_KEY_SIZE);
 	return keypair->k_state == HANDSHAKE_CREATED_INITIATION ? 0 : EINVAL;
@@ -3108,11 +3112,13 @@ wg_queue_pkt_decrypt(struct wg_queue_pkt *pkt)
 	size_t plaintext_len;
 	uint8_t version;
 
+
+	NET_EPOCH_ASSERT();
 	data = mtod(m, struct wg_pkt_data *);
 	plaintext_len = m->m_pkthdr.len - sizeof(struct wg_pkt_data);
 
 	keypair = pkt->p_keypair;
-	peer = wg_peer_ref(keypair->k_peer);
+	peer = keypair->k_peer;
 
 	pkt->p_nonce = le64toh(data->nonce);
 
