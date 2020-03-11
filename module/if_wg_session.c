@@ -222,7 +222,6 @@ int	wg_ratelimiter_allow(struct wg_ratelimiter *, struct mbuf *);
 /* Cookie */
 void	wg_precompute_key(uint8_t [WG_KEY_SIZE], const uint8_t [WG_KEY_SIZE],
 			  const char *);
-void	wg_cookie_checker_init(struct wg_cookie_checker *);
 void	wg_cookie_checker_precompute_device_keys(struct wg_softc *);
 void	wg_cookie_init(struct wg_cookie *);
 void	wg_cookie_precompute_peer_keys(struct wg_peer *);
@@ -452,6 +451,7 @@ wg_socket_init(struct wg_softc *sc)
 	if (rc)
 		goto fail;
 	rc = udp_set_kernel_tunneling(so->so_so4, wg_input, NULL, sc);
+	if_printf(ifp, "sc=%p\n", sc);
 	/*
 	 * udp_set_kernel_tunneling can only fail if there is already a tunneling function set.
 	 * This should never happen with a new socket.
@@ -2961,6 +2961,7 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 	int packet_needs_cookie;
 	int under_load;
 
+	DPRINTF(sc, "Receiving handshake packet\n");
 	if (*mtod(m, uint32_t *) == WG_PKT_COOKIE) {
 		DPRINTF(sc, "Receiving cookie response\n");
 		wg_cookie_message_consume(mtod(m, struct wg_pkt_cookie *), sc);
@@ -3190,6 +3191,7 @@ void
 wg_softc_handshake_receive(struct wg_softc *sc)
 {
 	struct mbuf *m;
+	DPRINTF(sc, "receiving handshake\n");
 	while ((m = mbufq_dequeue(&sc->sc_handshake_queue)) != NULL)
 		wg_receive_handshake_packet(sc, m);
 }
@@ -3317,33 +3319,47 @@ wg_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *sa,
 #endif
 
 void
-wg_input(struct mbuf *m, int offset, struct inpcb *inpcb,
+wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 		 const struct sockaddr *srcsa, void *_sc)
 {
 	struct wg_queue_pkt *pkt;
-	struct wg_pkt_data *data;
+	struct wg_pkt_data *pkt_data;
 	struct wg_softc *sc = _sc;
 	struct udphdr *uh;
+	struct mbuf *m;
 	int pktlen, pkttype, hlen;
+	struct wg_pkt_header *hdr;
+	void *data;
 
-	uh = (struct udphdr *)(m->m_data + offset);
+
+	printf("sc=%p\n", sc);
+	DPRINTF(sc, "%s(%p, %d, %p, %p, %p)\n",
+			__func__, m0, offset, inpcb, srcsa, _sc);
+	uh = (struct udphdr *)(m0->m_data + offset);
 	hlen = offset + sizeof(struct udphdr);
-	pkt = wg_mbuf_pkt_get(&m);
-	if (pkt == NULL)
-		goto free;
 
-	pkt->p_state = WG_PKT_STATE_CRYPTED;
+	m_adj(m0, hlen);
 
-	m_adj(m, hlen);
-
-	if (m_defrag(m, M_NOWAIT) != 0)
+	if ((m = m_defrag(m0, M_NOWAIT)) == NULL) {
+		DPRINTF(sc, "DEFRAG fail\n");
 		return;
+	}
+	data = mtod(m, void *);
+	hdr = mtod(m, struct wg_pkt_header *);
+	pkttype = hdr->type;
+
+	pkt = wg_mbuf_pkt_get(&m);
+	if (pkt == NULL) {
+		DPRINTF(sc, "no pkt\n");
+		goto free;
+	}
+	pkt->p_state = WG_PKT_STATE_CRYPTED;
 
 	if_inc_counter(sc->sc_ifp, IFCOUNTER_IPACKETS, 1);
 	if_inc_counter(sc->sc_ifp, IFCOUNTER_IBYTES, m->m_pkthdr.len);
 	pktlen = m->m_pkthdr.len;
-	pkttype = mtod(m, struct wg_pkt_header *)->type;
-	
+
+	DPRINTF(sc, "pktlen=%d pkttype=%d\n", pktlen, pkttype);
 	if ((pktlen == sizeof(struct wg_pkt_initiation) &&
 		 pkttype == WG_PKT_INITIATION) ||
 		(pktlen == sizeof(struct wg_pkt_response) &&
@@ -3357,10 +3373,9 @@ wg_input(struct mbuf *m, int offset, struct inpcb *inpcb,
 	} else if (pktlen >= sizeof(struct wg_pkt_data) + WG_MAC_SIZE
 	    && pkttype == WG_PKT_DATA) {
 
-		data = mtod(m, struct wg_pkt_data *);
-
+		pkt_data = data;
 		pkt->p_keypair = wg_hashtable_keypair_lookup(&sc->sc_hashtable,
-				data->receiver_index);
+				pkt_data->receiver_index);
 
 		if (pkt->p_keypair == NULL) {
 			if_inc_counter(sc->sc_ifp, IFCOUNTER_IERRORS, 1);
@@ -3407,13 +3422,6 @@ wg_clone_create(struct if_clone * ifc, int unit)
 	wg_route_init(&sc->sc_routes);
 
 	//sc->sc_taskq = taskq_create("wg_mp", ncpus, IPL_NET, TASKQ_MPSAFE);
-
-	mbufq_init(&sc->sc_handshake_queue, MAX_QUEUED_INCOMING_HANDSHAKES);
-	GROUPTASK_INIT(&sc->sc_handshake,
-	    (gtask_fn_t)wg_softc_handshake_receive, sc);
-
-	noise_local_init(&sc->sc_local);
-	wg_cookie_checker_init(&sc->sc_cookie_checker);
 
 	wg_queue_parallel_init(&sc->sc_encrypt_queue, IPL_NET);
 	wg_queue_parallel_init(&sc->sc_decrypt_queue, IPL_NET);

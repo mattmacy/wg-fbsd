@@ -68,6 +68,7 @@ MALLOC_DEFINE(M_WG, "WG", "wireguard");
 #define WG_CAPS														\
 	IFCAP_TSO |IFCAP_HWCSUM | IFCAP_VLAN_HWFILTER | IFCAP_VLAN_HWTAGGING | IFCAP_VLAN_HWCSUM |	\
 	IFCAP_VLAN_MTU | IFCAP_TXCSUM_IPV6 | IFCAP_HWCSUM_IPV6 | IFCAP_JUMBO_MTU | IFCAP_LINKSTATE
+TASKQGROUP_DECLARE(if_io_tqg);
 
 static int clone_count;
 
@@ -121,6 +122,7 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 		err = EBADMSG;
 		goto nvl_out;
 	}
+	wg_cookie_checker_init(&sc->sc_cookie_checker);
 
 	sc->sc_socket.so_port = listen_port;
 	local = &sc->sc_local;
@@ -137,6 +139,10 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	sc->wg_ctx = ctx;
 	sc->sc_ifp = iflib_get_ifp(ctx);
 
+	mbufq_init(&sc->sc_handshake_queue, MAX_QUEUED_INCOMING_HANDSHAKES);
+	GROUPTASK_INIT(&sc->sc_handshake, 0,
+	    (gtask_fn_t *)wg_softc_handshake_receive, sc);
+	taskqgroup_attach(qgroup_if_io_tqg, &sc->sc_handshake, sc, dev, NULL, "wg tx initiation");
 nvl_out:
 	nvlist_destroy(nvl);
 out:

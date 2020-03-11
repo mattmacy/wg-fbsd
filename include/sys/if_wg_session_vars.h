@@ -426,7 +426,9 @@ int	wg_route_init(struct wg_route_table *);
 int wg_socket_init(struct wg_softc *sc);
 void wg_socket_reinit(struct wg_softc *, struct socket *so4,
     struct socket *so6);
+void wg_softc_handshake_receive(struct wg_softc *sc);
 
+void	wg_cookie_checker_init(struct wg_cookie_checker *);
 
 void wg_noise_param_init(void);
 
