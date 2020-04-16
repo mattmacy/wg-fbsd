@@ -65,7 +65,6 @@
 	gtaskqueue_drain((gtask)->gt_taskqueue, &(gtask)->gt_task)
 TASKQGROUP_DECLARE(if_io_tqg);
 
-
 /*
  * m_dat / m_pktdat is inuse for wireguard internal state
  */
@@ -76,6 +75,18 @@ TASKQGROUP_DECLARE(if_io_tqg);
 #define	M_DAT_TYPE_ENDPOINT	0x2
 
 #define DPRINTF(sc,  ...) if_printf(sc->sc_ifp, ##__VA_ARGS__)
+
+static void *
+wg_mtod(struct mbuf *m0)
+{
+	if (m0->m_len)
+		return (m0->m_data);
+	MPASS(m0->m_next);
+	return (m0->m_next->m_data);
+}
+
+#undef mtod
+#define	mtod(m, t)	((t)(wg_mtod(m)))
 
 static inline uint64_t
 siphash24(const SIPHASH_KEY *key, const void *src, size_t len)
@@ -159,9 +170,6 @@ void	wg_hashtable_keypair_remove(struct wg_hashtable *,
 /* Noise */
 void	noise_remote_init(struct noise_remote *, const uint8_t [WG_KEY_SIZE]);
 void	noise_remote_set_psk(struct noise_remote *, uint8_t [WG_KEY_SIZE]);
-void	noise_local_init(struct noise_local *);
-void	noise_local_set_private(struct noise_local *,
-				const uint8_t [WG_KEY_SIZE]);
 
 struct noise_keypair *
 	noise_keypair_create(void);
@@ -489,15 +497,11 @@ wg_socket_reinit(struct wg_softc *sc, struct socket *new4,
 
 	so = &sc->sc_socket;
 
-	if (so->so_so4) {
-		SOCK_LOCK(so->so_so4);
-		sofree(so->so_so4);
-	}
+	if (so->so_so4)
+		soclose(so->so_so4);
 	so->so_so4 = new4;
-	if (so->so_so6) {
-		SOCK_LOCK(so->so_so6);
-		sofree(so->so_so6);
-	}
+	if (so->so_so6)
+		soclose(so->so_so6);
 	so->so_so6 = new6;
 }
 
@@ -1700,6 +1704,7 @@ noise_message_encrypt(uint8_t *dst, const uint8_t *src, size_t src_len,
 	/* Nonce always zero for Noise_IK */
 	chacha20poly1305_encrypt(dst, src, src_len, hash, WG_HASH_SIZE, 0, key);
 	noise_mix_hash(hash, dst, src_len + WG_MAC_SIZE);
+	printf("noise_message_encrypt - hash: %32D\n", hash, ":");
 }
 
 int
@@ -1831,23 +1836,32 @@ noise_handshake_consume_initiation(struct wg_pkt_initiation *src,
 				hash);
 
 	/* es */
-	if (noise_mix_dh(chaining_key, key, sc->sc_local.l_private, e) != 0)
+	if (noise_mix_dh(chaining_key, key, sc->sc_local.l_private, e) != 0) {
+		printf("mix fail\n");
 		goto out;
-
+	}
 	/* s */
 	if (noise_message_decrypt(s, src->encrypted_static,
-			     sizeof(src->encrypted_static), key, hash) != 0)
+			     sizeof(src->encrypted_static), key, hash) != 0) 
+	{
+		printf("decrypt fail\n");
 		goto out;
-
+	}
 	/* Lookup which peer we're actually talking to */
 	peer = wg_hashtable_peer_lookup(&sc->sc_hashtable, s);
-	if (peer == NULL)
+	if (peer == NULL) {
+		printf("peer lookup fail\n");
+
 		goto out;
 
+	}		
 	/* ss */
 	if (!curve25519(ss, sc->sc_local.l_private,
 				peer->p_remote.r_public))
+	{
+		printf("curve fail\n");
 		goto out;
+	}
 	noise_kdf(chaining_key, key, NULL, ss, WG_HASH_SIZE, WG_KEY_SIZE, 0,
 			WG_KEY_SIZE, chaining_key);
 
@@ -1862,18 +1876,22 @@ noise_handshake_consume_initiation(struct wg_pkt_initiation *src,
 
 	if (memcmp(t, peer->p_remote.r_ts, WG_TIMESTAMP_SIZE) > 0)
 		memcpy(peer->p_remote.r_ts, t, WG_TIMESTAMP_SIZE);
-	else
+	else {
+		printf("timestamp fail\n");
 		goto out_mtx; /* Replay attack */
-
+	}
 	if (wg_timers_expired(&peer->p_remote.r_last_init, 0,
 			1000*1000*1000 / INITIATIONS_PER_SECOND))
-		getnanotime(&peer->p_remote.r_last_init);
-	else
+		getnanotime(&peer->p_remote.r_last_init); 
+	else {
+		printf("flood fail\n");
+				
 		goto out_mtx; /* Flood attack */
-
-	if ((keypair = noise_keypair_create()) == NULL)
+	}
+	if ((keypair = noise_keypair_create()) == NULL) {
+		printf("kp create fail\n");
 		goto out_mtx;
-
+	}
 	memcpy(keypair->k_remote_ephemeral, e, WG_KEY_SIZE);
 	memcpy(keypair->k_hash, hash, WG_HASH_SIZE);
 	memcpy(keypair->k_chaining_key, chaining_key, WG_HASH_SIZE);
@@ -2116,9 +2134,10 @@ void
 wg_compute_mac1(uint8_t mac1[WG_COOKIE_SIZE], const void *message, size_t len,
     const uint8_t key[WG_KEY_SIZE])
 {
-	len = len - sizeof(struct wg_pkt_macs) +
+	size_t mlen = len - sizeof(struct wg_pkt_macs) +
 	      offsetof(struct wg_pkt_macs, mac1);
-	blake2s(mac1, message, key, WG_COOKIE_SIZE, len, WG_KEY_SIZE);
+
+	blake2s(mac1, message, key, WG_COOKIE_SIZE, mlen, WG_KEY_SIZE);
 }
 
 void
@@ -2173,12 +2192,17 @@ wg_cookie_validate_packet(struct wg_cookie_checker *checker, struct mbuf *m,
 	struct wg_pkt_macs *macs = (struct wg_pkt_macs *)
 		(mtod(m, uint8_t *) + m->m_pkthdr.len - sizeof(*macs));
 
+	printf("pktlen=%d\n", m->m_pkthdr.len);
+	printf("pkt:\n%148D\n", mtod(m, uint8_t *), ":");
 	mtx_lock(&checker->cc_mtx);
 	wg_compute_mac1(computed_mac, mtod(m, uint8_t *), m->m_pkthdr.len,
 	    checker->cc_message_mac1_key);
-	if (timingsafe_bcmp(computed_mac, macs->mac1, WG_COOKIE_SIZE))
+	if (timingsafe_bcmp(computed_mac, macs->mac1, WG_COOKIE_SIZE)) {
+		printf("computed %16D\n", computed_mac, ":");
+		printf("got        %16D\n", macs->mac1, ":");
+		printf("MAC  1 mismatch\n");
 		goto out;
-
+	}
 	ret = VALID_MAC_BUT_NO_COOKIE;
 
 	if (!check_cookie)
@@ -2189,13 +2213,15 @@ wg_cookie_validate_packet(struct wg_cookie_checker *checker, struct mbuf *m,
 
 	wg_compute_mac2(computed_mac, mtod(m, uint8_t *), m->m_pkthdr.len,
 	    cookie);
-	if (timingsafe_bcmp(computed_mac, macs->mac2, WG_COOKIE_SIZE))
+	if (timingsafe_bcmp(computed_mac, macs->mac2, WG_COOKIE_SIZE)) {
+		printf("MAC  2 mismatch\n");
 		goto out;
-
+	}
 	ret = VALID_MAC_WITH_COOKIE_BUT_RATELIMITED;
-	if (wg_ratelimiter_allow(NULL, m) != 0)
+	if (wg_ratelimiter_allow(NULL, m) != 0) {
+		printf("ratelimiter reject\n");
 		goto out;
-
+	}
 	ret = VALID_MAC_WITH_COOKIE;
 out:
 	mtx_unlock(&checker->cc_mtx);
@@ -2895,6 +2921,7 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 		udp = (struct udphdr *)(mtod(m, caddr_t) + sizeof(*ip4));
 		udp->uh_dport = rport;
 		udp->uh_ulen = htons(sizeof(*udp) + len);
+		udp->uh_sport = htons(so->so_port);
 		pr  = inp->inp_socket->so_proto->pr_protocol;
 		udp->uh_sum =  in_pseudo(ip4->ip_src.s_addr, ip4->ip_dst.s_addr,
 		    htons((u_short)len + sizeof(struct udphdr) + pr));
@@ -3338,6 +3365,7 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 	uh = (struct udphdr *)(m0->m_data + offset);
 	hlen = offset + sizeof(struct udphdr);
 
+	printf("offset=%d hlen=%d\n", offset, hlen);
 	m_adj(m0, hlen);
 
 	if ((m = m_defrag(m0, M_NOWAIT)) == NULL) {

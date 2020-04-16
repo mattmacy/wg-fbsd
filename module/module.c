@@ -126,11 +126,10 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 
 	sc->sc_socket.so_port = listen_port;
 	local = &sc->sc_local;
-	memcpy(local->l_private, key, size);
-	rw_init(&local->l_lock, "local key lock");
-	curve25519_clamp_secret(local->l_private);
-	local->l_has_identity = curve25519_generate_public(local->l_public, key);
-
+	noise_local_init(local);
+	noise_local_set_private(local, key);
+	wg_cookie_checker_precompute_device_keys(sc);
+	
 	atomic_add_int(&clone_count, 1);
 	scctx = sc->shared = iflib_get_softc_ctx(ctx);
 	scctx->isc_capenable = WG_CAPS;
@@ -243,6 +242,7 @@ wg_detach(if_ctx_t ctx)
 	//sc->wg_accept_port = 0;
 	wg_socket_reinit(sc, NULL, NULL);
 	wg_peer_remove_all(sc);
+	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_handshake);
 	rw_destroy(&sc->sc_local.l_lock);
 	atomic_add_int(&clone_count, -1);
 

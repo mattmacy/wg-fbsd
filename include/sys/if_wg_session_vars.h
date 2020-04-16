@@ -429,9 +429,11 @@ void wg_socket_reinit(struct wg_softc *, struct socket *so4,
 void wg_softc_handshake_receive(struct wg_softc *sc);
 
 void	wg_cookie_checker_init(struct wg_cookie_checker *);
+void wg_cookie_checker_precompute_device_keys(struct wg_softc *sc);
 
 void wg_noise_param_init(void);
-
-
+void noise_local_init(struct noise_local *local);
+void	noise_local_set_private(struct noise_local *,
+				const uint8_t [WG_KEY_SIZE]);
 
 #endif /* _IF_WG_VARS_H_ */
