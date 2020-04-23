@@ -309,8 +309,6 @@ struct m_dat_hdr {
 static volatile uint64_t keypair_counter = 0;
 static volatile unsigned long peer_counter = 0;
 
-
-
 static inline int
 callout_del(struct callout *c)
 {
@@ -1681,20 +1679,14 @@ noise_mix_psk(uint8_t ck[WG_HASH_SIZE], uint8_t hash[WG_HASH_SIZE],
 	explicit_bzero(tmp, WG_HASH_SIZE);
 }
 
-void
-noise_param_init(uint8_t ck[WG_HASH_SIZE], uint8_t hash[WG_HASH_SIZE],
-		const uint8_t remote_static[WG_KEY_SIZE])
+static void
+handshake_init(uint8_t chaining_key[WG_HASH_SIZE],
+			   u8 hash[NOISE_HASH_LEN],
+			   const u8 remote_static[NOISE_PUBLIC_KEY_LEN])
 {
-	struct blake2s_state blake;
-
-	blake2s(ck, HANDSHAKE_NAME, NULL,
-		WG_HASH_SIZE, strlen(HANDSHAKE_NAME), 0);
-	blake2s_init(&blake, WG_HASH_SIZE);
-	blake2s_update(&blake, ck, WG_HASH_SIZE);
-	blake2s_update(&blake, IDENTIFIER_NAME, strlen(IDENTIFIER_NAME));
-	blake2s_final(&blake, hash, WG_HASH_SIZE);
-
-	noise_mix_hash(hash, remote_static, WG_KEY_SIZE);
+	memcpy(hash, handshake_init_hash, WG_HASH_SIZE);
+	memcpy(chaining_key, handshake_init_chaining_key, WG_HASH_SIZE);
+	noise_mix_hash(hash, remote_static,  WG_KEY_SIZE);
 }
 
 void
@@ -1767,7 +1759,7 @@ noise_handshake_create_initiation(struct wg_pkt_initiation *dst,
 		printf("%s doesn't have identity\n", __func__);
 		goto out;
 	}
-	noise_param_init(keypair->k_chaining_key, keypair->k_hash,
+	handshake_init(keypair->k_chaining_key, keypair->k_hash,
 			peer->p_remote.r_public);
 
 	/* e */
@@ -1829,7 +1821,11 @@ noise_handshake_consume_initiation(struct wg_pkt_initiation *src,
 	if (!sc->sc_local.l_has_identity)
 		goto out;
 
-	noise_param_init(chaining_key, hash, sc->sc_local.l_public);
+	printf("header: %x sender_index %x ephem: %32D\n static: %48D\n",
+		   src->header.type, src->sender_index, src->unencrypted_ephemeral, "",
+		   src->encrypted_static, "");
+
+	handshake_init(chaining_key, hash, sc->sc_local.l_public);
 
 	/* e */
 	noise_message_ephemeral(e, src->unencrypted_ephemeral, chaining_key,

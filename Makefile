@@ -12,6 +12,8 @@ KMOD=   if_wg
 
 .PATH: ${SRCDIR}
 .PATH: ${ZINCDIR}
+.PATH: ${ZINCDIR}/chacha20
+.PATH: ${ZINCDIR}/poly1305
 
 CFLAGS+= -I${INCDIR}
 
@@ -31,4 +33,6 @@ SRCS+= opt_inet.h opt_inet6.h device_if.h bus_if.h ifdi_if.h
 
 #SRCS+= module.c cookie.c noise.c peer.c whitelist.c
 SRCS+= if_wg_session.c module.c curve25519.c blake2s.c
+
+SRCS+= chacha20poly1305.c chacha20.c poly1305.c
 .include <bsd.kmod.mk>

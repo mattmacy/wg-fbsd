@@ -655,6 +655,7 @@ MODULE_VERSION(wg, 1);
 MODULE_DEPEND(wg, iflib, 1, 1, 1);
 MODULE_DEPEND(wg, blake2, 1, 1, 1);
 MODULE_DEPEND(wg, crypto, 1, 1, 1);
+#if 0
 
 /*
  * TEMPORARY 
@@ -663,7 +664,7 @@ MODULE_DEPEND(wg, crypto, 1, 1, 1);
 /*
  * Need to include uninstalled sys/contrib headers :-|
  */
-int crypto_aead_chacha20poly1305_encrypt_detached(unsigned char *c,
+int crypto_aead_chacha20poly1305_ietf_encrypt_detached(unsigned char *c,
                                                   unsigned char *mac,
                                                   unsigned long long *maclen_p,
                                                   const unsigned char *m,
@@ -676,7 +677,7 @@ int crypto_aead_chacha20poly1305_encrypt_detached(unsigned char *c,
 
 
 int
-crypto_aead_chacha20poly1305_decrypt_detached(unsigned char *m,
+crypto_aead_chacha20poly1305_ietf_decrypt_detached(unsigned char *m,
                                               unsigned char *nsec,
                                               const unsigned char *c,
                                               unsigned long long clen,
@@ -717,7 +718,7 @@ void chacha20poly1305_encrypt(u8 *dst, const u8 *src, const size_t src_len,
 			      const u64 nonce,
 			      const u8 key[CHACHA20POLY1305_KEY_SIZE])
 {
-	crypto_aead_chacha20poly1305_encrypt_detached(dst, dst + src_len, NULL, src, src_len, ad, ad_len, NULL, (const char *)&nonce, key);
+	crypto_aead_chacha20poly1305_ietf_encrypt_detached(dst, dst + src_len, NULL, src, src_len, ad, ad_len, NULL, (const char *)&nonce, key);
 }
 
 
@@ -728,7 +729,9 @@ bool chacha20poly1305_decrypt(u8 *dst, const u8 *src, const size_t src_len,
 {
 	int err;
 
-	err = crypto_aead_chacha20poly1305_decrypt_detached(dst, NULL, src, src_len, src + src_len, ad, ad_len, (const char *)&nonce, key);
+	err = crypto_aead_chacha20poly1305_ietf_decrypt_detached(dst, NULL, src, src_len, src + src_len, ad, ad_len, (const char *)&nonce, key);
+	printf("%s(%p, %p, %lu, %p, %lu, %lu, %32D) = %d\n",
+		   __func__, dst, src, src_len, ad, ad_len, nonce, key, "", err);
 	return (err == 0);
 }
 
@@ -751,3 +754,4 @@ bool xchacha20poly1305_decrypt(u8 *dst, const u8 *src, const size_t src_len,
 	err = crypto_aead_xchacha20poly1305_ietf_decrypt_detached(dst, NULL, src, src_len, src + src_len, ad, ad_len, (const char *)&nonce, key);
 	return (err == 0);
 }
+#endif
