@@ -6,6 +6,9 @@
 #include <sys/endian.h>
 #include <sys/libkern.h>
 #include <sys/malloc.h>
+#include <sys/proc.h>
+
+#include <machine/fpu.h>
 
 #define COMPAT_ZINC_IS_A_MODULE
 MALLOC_DECLARE(M_WG);
@@ -17,11 +20,16 @@ typedef uint32_t __le32;
 typedef uint64_t  u64;
 typedef uint64_t  __le64;
 
+#define __must_check		__attribute__((__warn_unused_result__))
+
 #define get_unaligned_le32(x) le32dec(x)
 #define get_unaligned_le64(x) le64dec(x)
 
 #define cpu_to_le64(x) htole64(x)
 #define cpu_to_le32(x) htole32(x)
+
+
+#define	need_resched() (curthread->td_flags & (TDF_NEEDRESCHED|TDF_ASTPENDING))
 
 static inline void
 put_unaligned_le32(u32 val, void *p)
@@ -37,13 +45,72 @@ put_unaligned_le32(u32 val, void *p)
 #define EXPORT_SYMBOL(x)
 
 #define U32_MAX		((u32)~0U)
-#define DONT_USE_SIMD ((simd_context_t []){ })
 
-typedef struct simd_context {} simd_context_t;
+#define	kfpu_begin() {							\
+	critical_enter();					\
+	fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX); \
+}
 
-#define simd_get(x)
-#define simd_put(x)
-#define simd_relax(x)
+#define	kfpu_end()	 {						 \
+		fpu_kern_leave(curthread, NULL); \
+		critical_exit();			     \
+}
+
+typedef enum {
+	HAVE_NO_SIMD = 1 << 0,
+	HAVE_FULL_SIMD = 1 << 1,
+	HAVE_SIMD_IN_USE = 1 << 31
+} simd_context_t;
+
+#define DONT_USE_SIMD ((simd_context_t []){ HAVE_NO_SIMD })
+
+static __must_check inline bool
+may_use_simd(void)
+{
+#if defined(__amd64__)
+	return true;
+#else
+	return false;
+#endif
+}
+
+static inline void
+simd_get(simd_context_t *ctx)
+{
+	*ctx = may_use_simd() ? HAVE_FULL_SIMD : HAVE_NO_SIMD;
+}
+
+static inline void
+simd_put(simd_context_t *ctx)
+{
+	if (*ctx & HAVE_SIMD_IN_USE)
+		kfpu_end();
+	*ctx = HAVE_NO_SIMD;
+}
+
+static __must_check inline bool
+simd_use(simd_context_t *ctx)
+{
+	if (!(*ctx & HAVE_FULL_SIMD))
+		return false;
+	if (*ctx & HAVE_SIMD_IN_USE)
+		return true;
+	kfpu_begin();
+	*ctx |= HAVE_SIMD_IN_USE;
+	return true;
+}
+
+static inline bool
+simd_relax(simd_context_t *ctx)
+{
+	if ((*ctx & HAVE_SIMD_IN_USE) && need_resched()) {
+		simd_put(ctx);
+		simd_get(ctx);
+		return true;
+	}
+	return false;
+}
+
 #define unlikely(x) __predict_false(x)
 #define likely(x) __predict_true(x)
 /* Generic path for arbitrary size */
