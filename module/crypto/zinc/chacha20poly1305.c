@@ -182,8 +182,10 @@ __chacha20poly1305_decrypt(u8 *dst, const u8 *src, const size_t src_len,
 		__le64 lens[2];
 	} b = { { 0 } };
 
-	if (unlikely(src_len < POLY1305_MAC_SIZE))
+	if (unlikely(src_len < POLY1305_MAC_SIZE)) {
+		printf("src_len too short\n");
 		return false;
+	}
 
 	chacha20_init(&chacha20_state, key, nonce);
 	chacha20(&chacha20_state, b.block0, b.block0, sizeof(b.block0),
@@ -209,7 +211,10 @@ __chacha20poly1305_decrypt(u8 *dst, const u8 *src, const size_t src_len,
 	ret = crypto_memneq(b.mac, src + dst_len, POLY1305_MAC_SIZE);
 	if (likely(!ret))
 		chacha20(&chacha20_state, dst, src, dst_len, simd_context);
-
+	else {
+		printf("calculated: %16D\n", b.mac, "");
+		printf("sent      : %16D\n", src + dst_len, "");
+	}
 	memzero_explicit(&chacha20_state, sizeof(chacha20_state));
 	memzero_explicit(&b, sizeof(b));
 

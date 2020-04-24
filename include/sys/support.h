@@ -7,11 +7,23 @@
 #include <sys/libkern.h>
 #include <sys/malloc.h>
 #include <sys/proc.h>
+#include <sys/lock.h>
 
 #include <machine/fpu.h>
 
 #define COMPAT_ZINC_IS_A_MODULE
 MALLOC_DECLARE(M_WG);
+
+#define	BUILD_BUG_ON(x)			CTASSERT(!(x))
+
+#define BIT(nr)                 (1UL << (nr))
+#define BIT_ULL(nr)             (1ULL << (nr))
+#ifdef __LP64__
+#define BITS_PER_LONG           64
+#else
+#define BITS_PER_LONG           32
+#endif
+
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -143,7 +155,7 @@ __crypto_memneq_generic(const void *a, const void *b, size_t size)
 static inline void
 __cpu_to_le32s(uint32_t *buf)
 {
-	*buf = htole32(buf);
+	*buf = htole32(*buf);
 }
 
 static inline void cpu_to_le32_array(u32 *buf, unsigned int words)
@@ -205,8 +217,21 @@ SYSUNINIT(zfs_ ## fn, SI_SUB_LAST, SI_ORDER_FIRST, wrap_ ## fn, NULL)
 #define __init
 #define __exit
 #define BUG() panic("%s:%d bug hit!\n", __FILE__, __LINE__)
+
+#define	WARN_ON(cond) ({					\
+      bool __ret = (cond);					\
+      if (__ret) {						\
+		printf("WARNING %s failed at %s:%d\n",		\
+		    __stringify(cond), __FILE__, __LINE__);	\
+      }								\
+      unlikely(__ret);						\
+})
+
 #define pr_err printf
+#define pr_info printf
 #define IS_ENABLED(x) 0
+#define	___stringify(...)		#__VA_ARGS__
+#define	__stringify(...)		___stringify(__VA_ARGS__)
 #define kmalloc(size, flag) malloc((size), M_WG, M_WAITOK)
 #define kfree(p) free(p, M_WG)
 #define vzalloc(size) malloc((size), M_WG, M_WAITOK|M_ZERO)
