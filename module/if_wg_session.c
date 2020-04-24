@@ -2504,6 +2504,7 @@ void
 wg_peer_send_handshake_response(struct wg_peer *peer)
 {
 	struct wg_pkt_response resp;
+	struct epoch_tracker et;
 
 	rw_wlock(&peer->p_timers.t_lock);
 	getnanotime(&peer->p_timers.t_last_sent_handshake);
@@ -2512,6 +2513,7 @@ wg_peer_send_handshake_response(struct wg_peer *peer)
 	DPRINTF(peer->p_sc, "Sending handshake response to peer %lu\n",
 			peer->p_id);
 
+	NET_EPOCH_ENTER(et);
 	if (noise_handshake_create_response(&resp, peer) == 0) {
 		wg_cookie_add_mac_to_packet(&peer->p_cookie, &resp,
 					    sizeof(resp));
@@ -2523,6 +2525,8 @@ wg_peer_send_handshake_response(struct wg_peer *peer)
 			wg_peer_enqueue_buffer(peer, &resp, sizeof(resp));
 		}
 	}
+	NET_EPOCH_EXIT(et);
+
 }
 
 void
