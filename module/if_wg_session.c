@@ -325,7 +325,7 @@ wg_m_freem_(struct mbuf *m, char *file, int line)
 #define wg_m_freem(m) wg_m_freem_((m), __FILE__, __LINE__)
 
 static const uint8_t handshake_name[37] = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
-static const uint8_t identifier_name[30] = "WireGuard v1 FreeBSD.org";
+static const u8 identifier_name[34] = "WireGuard v1 zx2c4 Jason@zx2c4.com";
 static __read_mostly uint8_t handshake_init_hash[NOISE_HASH_LEN];
 static __read_mostly uint8_t handshake_init_chaining_key[NOISE_HASH_LEN];
 //static atomic64_t keypair_counter = ATOMIC64_INIT(0);
@@ -3354,8 +3354,6 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 	struct wg_pkt_header *hdr;
 	void *data;
 
-
-	printf("sc=%p\n", sc);
 	DPRINTF(sc, "%s(%p, %d, %p, %p, %p)\n",
 			__func__, m0, offset, inpcb, srcsa, _sc);
 	uh = (struct udphdr *)(m0->m_data + offset);
@@ -3371,7 +3369,6 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 	data = mtod(m, void *);
 	hdr = mtod(m, struct wg_pkt_header *);
 	pkttype = hdr->type;
-
 	pkt = wg_mbuf_pkt_get(&m);
 	if (pkt == NULL) {
 		DPRINTF(sc, "no pkt\n");
