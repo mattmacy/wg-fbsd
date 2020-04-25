@@ -32,6 +32,7 @@
 #include <sys/rwlock.h>
 #include <sys/protosw.h>
 #include <sys/endian.h>
+#include <sys/kdb.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
@@ -79,10 +80,7 @@ TASKQGROUP_DECLARE(if_io_tqg);
 static void *
 wg_mtod(struct mbuf *m0)
 {
-	if (m0->m_len)
-		return (m0->m_data);
-	MPASS(m0->m_next);
-	return (m0->m_next->m_data);
+	return (m0->m_data);
 }
 
 #undef mtod
@@ -131,7 +129,6 @@ void	wg_peer_timers_stop(struct wg_peer *);
 int	wg_timers_expired(struct timespec *, time_t, long);
 
 /* Queue */
-void	wg_pktq_init(struct wg_pktq *, const char *);
 void	wg_pktq_enqueue(struct wg_pktq *, struct wg_pktq *,
 			 struct wg_queue_pkt *);
 void	wg_pktq_serial_enqueue(struct wg_pktq *,
@@ -271,9 +268,9 @@ void	wg_peer_flush_staged_packets(struct wg_peer *);
 
 /* Packet */
 static struct wg_endpoint *
-	wg_mbuf_endpoint_get(struct mbuf **);
+	wg_mbuf_endpoint_get(struct mbuf *);
 static struct wg_queue_pkt *
-	wg_mbuf_pkt_get(struct mbuf **);
+	wg_mbuf_pkt_get(struct mbuf *);
 int	wg_mbuf_add_ipudp(struct mbuf **, struct wg_socket *,
 			  struct wg_endpoint *);
 
@@ -284,8 +281,6 @@ struct wg_peer	*
 	wg_queue_pkt_decrypt(struct wg_queue_pkt *);
 
 void	wg_softc_handshake_receive(struct wg_softc *);
-void	wg_softc_decrypt(struct wg_softc *);
-void	wg_softc_encrypt(struct wg_softc *);
 
 /* Interface */
 void	wg_start(struct ifqueue *);
@@ -624,6 +619,7 @@ wg_socket_send_mbuf(struct wg_socket *so, struct mbuf *m, uint16_t family)
 			break;
 		}
 	}
+	printf("ip_output()->%d\n", err);
 	CURVNET_RESTORE();
 	return (err);
 }
@@ -929,6 +925,12 @@ wg_pktq_init(struct wg_pktq *q, const char *name)
 	mtx_init(&q->q_mtx, name, NULL, MTX_DEF);
 	q->q_len = 0;
 	STAILQ_INIT(&q->q_items);
+}
+
+void
+wg_pktq_deinit(struct wg_pktq *q)
+{
+	mtx_destroy(&q->q_mtx);
 }
 
 void
@@ -1385,6 +1387,7 @@ noise_keypair_attach_to_peer(struct noise_keypair *keypair,
 
 	DPRINTF(keypair->k_peer->p_sc, "Keypair %lu created for peer %lu\n",
 		keypair->k_id, keypair->k_peer->p_id);
+	printf("kp endpoint: %48D\n", &peer->p_endpoint, ":");
 }
 
 struct noise_keypair *
@@ -2204,7 +2207,7 @@ wg_cookie_validate_packet(struct wg_cookie_checker *checker, struct mbuf *m,
 	if (!check_cookie)
 		goto out;
 
-	e = wg_mbuf_endpoint_get(&m);
+	e = wg_mbuf_endpoint_get(m);
 	wg_make_cookie(cookie, e, checker);
 
 	wg_compute_mac2(computed_mac, mtod(m, uint8_t *), m->m_pkthdr.len,
@@ -2256,7 +2259,7 @@ wg_cookie_message_create(struct wg_pkt_cookie *dst, struct mbuf *m,
 	dst->receiver_index = index;
 	arc4random_buf(dst->nonce, WG_XNONCE_SIZE);
 
-	e = wg_mbuf_endpoint_get(&m);
+	e = wg_mbuf_endpoint_get(m);
 
 	mtx_lock(&checker->cc_mtx);
 	wg_make_cookie(cookie, e, checker);
@@ -2398,6 +2401,7 @@ wg_peer_ref(struct wg_peer *peer)
 void
 wg_peer_put(struct wg_peer *peer)
 {
+	return; /* XXX */
 
 	if (peer != NULL && refcount_release(&peer->p_refcnt))
 		NET_EPOCH_CALL(wg_peer_free, &peer->p_ctx);
@@ -2434,6 +2438,8 @@ wg_peer_destroy(struct wg_peer **peer_p)
 	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_send);
 	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_recv);
 	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_tx_initiation);
+	wg_pktq_deinit(&peer->p_send_queue);
+	wg_pktq_deinit(&peer->p_recv_queue);
 
 	wg_peer_put(peer);
 }
@@ -2538,7 +2544,7 @@ wg_softc_send_handshake_cookie(struct wg_softc *sc, struct mbuf *m,
 
 	DPRINTF(sc, "Sending cookie response for denied handshake message\n");
 
-	e = wg_mbuf_endpoint_get(&m);
+	e = wg_mbuf_endpoint_get(m);
 	wg_cookie_message_create(&cookie, m, index, &sc->sc_cookie_checker);
 	wg_socket_send_buffer(&sc->sc_socket, &cookie, sizeof(cookie), e);
 }
@@ -2546,14 +2552,13 @@ wg_softc_send_handshake_cookie(struct wg_softc *sc, struct mbuf *m,
 void
 wg_peer_set_endpoint_from_mbuf(struct wg_peer *peer, struct mbuf *m)
 {
-	struct wg_endpoint *e = wg_mbuf_endpoint_get(&m);
+	struct wg_endpoint *e = wg_mbuf_endpoint_get(m);
 
+	MPASS(e->e_remote.r_sa.sa_family != 0);
 	if (memcmp(e, &peer->p_endpoint, sizeof(*e)) == 0)
 		return;
 
-	rw_wlock(&peer->p_endpoint_lock);
 	peer->p_endpoint = *e;
-	rw_wunlock(&peer->p_endpoint_lock);
 }
 
 void
@@ -2568,9 +2573,7 @@ int
 wg_peer_mbuf_add_ipudp(struct wg_peer *peer, struct mbuf **m)
 {
 	int err;
-	rw_rlock(&peer->p_endpoint_lock);
 	err = wg_mbuf_add_ipudp(m, &peer->p_sc->sc_socket, &peer->p_endpoint);
-	rw_runlock(&peer->p_endpoint_lock);
 	return err;
 }
 
@@ -2604,11 +2607,16 @@ wg_peer_recv(struct wg_peer *peer)
 {
 	struct mbuf *m;
 	struct wg_softc *sc;
+	struct wg_socket *so;
 	struct wg_queue_pkt *pkt;
+	struct epoch_tracker et;
+	struct inpcb *inp;
 	int version;
 
 	sc = peer->p_sc;
+	so = &sc->sc_socket;
 
+	NET_EPOCH_ENTER(et);
 	while ((pkt = wg_pktq_serial_dequeue(&peer->p_recv_queue)) != NULL) {
 		m = pkt->p_pkt;
 		if (pkt->p_state == WG_PKT_STATE_CLEAR) {
@@ -2619,16 +2627,24 @@ wg_peer_recv(struct wg_peer *peer)
 			m->m_pkthdr.rcvif = sc->sc_ifp;
 			version = mtod(m, struct ip *)->ip_v;
 			BPF_MTAP(sc->sc_ifp, m);
-			if (version == IPVERSION)
+			if (version == IPVERSION) {
+				inp = sotoinpcb(so->so_so4);
+				CURVNET_SET(inp->inp_vnet);
 				ip_input(m);
-			else if (version == 6)
+				CURVNET_RESTORE();
+			}	else if (version == 6) {
+				inp = sotoinpcb(so->so_so6);
+				CURVNET_SET(inp->inp_vnet);
 				ip6_input(m);
-			else
+				CURVNET_RESTORE();
+			} else
 				wg_m_freem(m);
 		} else {
 			wg_m_freem(m);
 		}
 	}
+	NET_EPOCH_EXIT(et);
+
 	wg_peer_put(peer);
 }
 
@@ -2649,7 +2665,7 @@ wg_peer_enqueue_buffer(struct wg_peer *peer, void *buf, size_t len)
 
 	MPASS(m->m_len > 0);
 	MPASS(m->m_pkthdr.len > 0);
-	pkt = wg_mbuf_pkt_get(&m);
+	pkt = wg_mbuf_pkt_get(m);
 	MPASS(pkt->p_pkt == m);
 	MPASS(m->m_pkthdr.len == len);
 	pkt->p_state = WG_PKT_STATE_CRYPTED;
@@ -2664,7 +2680,9 @@ void
 wg_peer_send_keepalive(struct wg_peer *peer)
 {
 	struct mbuf *m;
+	struct epoch_tracker et;
 
+	 MPASS(peer->p_endpoint.e_remote.r_sa.sa_family != 0);
 	if (mbufq_len(&peer->p_staged_packets) == 0 &&
 	    (m = m_gethdr(M_NOWAIT, MT_DATA)) != NULL) {
 		mbufq_enqueue(&peer->p_staged_packets, m);
@@ -2673,7 +2691,9 @@ wg_peer_send_keepalive(struct wg_peer *peer)
 				peer->p_id);
 	}
 
+	NET_EPOCH_ENTER(et);
 	wg_peer_send_staged_packets(peer);
+	NET_EPOCH_EXIT(et);
 }
 
 void
@@ -2714,7 +2734,7 @@ wg_peer_send_staged_packets(struct wg_peer *peer)
 	while (wg_pktq_parallel_len(&sc->sc_encrypt_queue) < MAX_QUEUED_PACKETS
 			&& (m = mbufq_dequeue(&mq)) != NULL) {
 
-		pkt = wg_mbuf_pkt_get(&m);
+		pkt = wg_mbuf_pkt_get(m);
 		pkt->p_state = WG_PKT_STATE_CLEAR;
 		pkt->p_nonce = wg_counter_next(&keypair->k_counter);
 
@@ -2756,110 +2776,52 @@ wg_peer_flush_staged_packets(struct wg_peer *peer)
 
 /* Packet */
 
-static struct mbuf *
-wg_mbuf_pkthdr_move(struct mbuf *m)
+static struct wg_tag *
+wg_tag_get(struct mbuf *m)
 {
-	struct mbuf *mh;
+	struct m_tag *tag;
 
-	mh = m_gethdr(M_NOWAIT, MT_DATA);
-	if (mh == NULL)
-			return (NULL);
-	memcpy(&mh->m_pkthdr, &m->m_pkthdr, sizeof(struct pkthdr));
-	m_demote_pkthdr(m);
-	mh->m_next = m;
-	return (mh);
+	tag = m_tag_find(m, MTAG_WIREGUARD, NULL);
+	if (tag == NULL) {
+		tag = m_tag_get(MTAG_WIREGUARD, sizeof(struct wg_tag), M_NOWAIT|M_ZERO);
+		((struct wg_tag *)tag)->wt_queue_pkt.p_pkt = m;
+		m_tag_prepend(m, tag);
+		MPASS(!SLIST_EMPTY(&m->m_pkthdr.tags));
+		MPASS(m_tag_locate(m, MTAG_ABI_COMPAT, MTAG_WIREGUARD, NULL) == tag);
+	}
+	return (struct wg_tag *)tag;
 }
 
 static struct wg_endpoint *
-wg_mbuf_endpoint_get(struct mbuf **m0)
+wg_mbuf_endpoint_get(struct mbuf *m)
 {
-	struct m_dat_hdr *hdr;
-	struct wg_queue_pkt *wqpkt;
-	struct mbuf *m;
+	struct wg_tag *hdr;
 
-	m = *m0;
-	MPASS(m->m_flags & M_PKTHDR);
-	if (((m->m_flags & M_DAT_INUSE) == 0) &&
-		((m->m_flags  & M_EXT) == 0) &&
-		(m->m_len  > 0)) {
-		/*
-		 * We can't readily use m_dat
-		 */
-		if ((m = wg_mbuf_pkthdr_move(m)) == NULL)
-			return (NULL);
-		*m0 = m;
-	}
+	if ((hdr = wg_tag_get(m)) == NULL)
+		return (NULL);
 
-	/*
-	 * m->m_dat is not in use
-	 */
-	hdr = (struct m_dat_hdr *)(m->m_pktdat + sizeof(struct m_ext));
-	if ((m->m_flags & M_DAT_INUSE) == 0) {
-		m->m_flags |= M_DAT_INUSE;
-		hdr->mdh_types[0] = M_DAT_TYPE_ENDPOINT;
-		hdr->mdh_types[1] = M_DAT_TYPE_UNUSED;
-	}
-	switch (hdr->mdh_types[0]) {
-		case M_DAT_TYPE_ENDPOINT:
-			return (struct wg_endpoint *)(hdr +1);
-		case M_DAT_TYPE_QPKT:
-			wqpkt = (struct wg_queue_pkt *)(hdr +1);
-			if (hdr->mdh_types[1] == M_DAT_TYPE_UNUSED)
-				hdr->mdh_types[1] = M_DAT_TYPE_ENDPOINT;
-			return (struct wg_endpoint *)(wqpkt +1);
-		default:
-			panic("invalid M_DAT type");
-	}
-	return (NULL);
+	return (&hdr->wt_endpoint);
+}
+
+static void
+verify_endpoint(struct mbuf *m)
+{
+#ifdef INVARIANTS
+	struct wg_endpoint *e = wg_mbuf_endpoint_get(m);
+
+	MPASS(e->e_remote.r_sa.sa_family != 0);
+#endif
 }
 
 static struct wg_queue_pkt *
-wg_mbuf_pkt_get(struct mbuf **m0)
+wg_mbuf_pkt_get(struct mbuf *m)
 {
-	struct m_dat_hdr *hdr;
-	struct wg_endpoint *wend;
-	struct wg_queue_pkt *pkt;
-	struct mbuf *m = *m0;
+	struct wg_tag *hdr;
 
-	MPASS(m->m_flags & M_PKTHDR);
-	if ((m->m_flags  & M_EXT) == 0) {
-		/*
-		 * We can't readily use m_pktdat
-		 */
-		printf("moving pkthdr\n");
-		if ((m = wg_mbuf_pkthdr_move(m)) == NULL)
-			return (NULL);
-		*m0 = m;
-	}
+	if ((hdr = wg_tag_get(m)) == NULL)
+		return (NULL);
 
-	/*
-	 * m->m_pktdat is not in use
-	 */
-	hdr = (struct m_dat_hdr *)(m->m_pktdat + sizeof(struct m_ext));
-	if ((m->m_flags & M_DAT_INUSE) == 0) {
-		m->m_flags |= M_DAT_INUSE;
-		hdr->mdh_types[0] = M_DAT_TYPE_QPKT;
-		hdr->mdh_types[1] = M_DAT_TYPE_UNUSED;
-		pkt = (struct wg_queue_pkt *)(hdr +1);
-		bzero(pkt, sizeof(*pkt));
-		pkt->p_pkt = m;
-	}
-	switch (hdr->mdh_types[0]) {
-		case M_DAT_TYPE_QPKT:
-			return (struct wg_queue_pkt *)(hdr +1);
-		case M_DAT_TYPE_ENDPOINT:
-			wend = (struct wg_endpoint *)(hdr +1);
-			if (hdr->mdh_types[1] == M_DAT_TYPE_UNUSED) {
-				hdr->mdh_types[1] = M_DAT_TYPE_QPKT;
-				pkt = (struct wg_queue_pkt *)(wend +1);
-				bzero(pkt, sizeof(*pkt));
-				pkt->p_pkt = m;
-			}
-			return (struct wg_queue_pkt *)(wend +1);
-		default:
-			panic("invalid M_DAT type");
-	}
-	return (NULL);
+	return (&hdr->wt_queue_pkt);
 }
 
 int
@@ -2879,6 +2841,7 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 	in_port_t rport;
 	uint8_t  pr;
 
+	printf("endpoint: %48D\n", e, ":");
 	MPASS(len > 0);
 	MPASS(m->m_len > 0);
 	td = curthread;
@@ -2908,9 +2871,10 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 			CURVNET_SET(inp->inp_vnet);
 			err = in_pcbladdr(inp, &e->e_remote.r_sin.sin_addr, &laddr4, td->td_ucred);
 			CURVNET_RESTORE();
-			if (err != 0)
+			if (err != 0) {
+				printf("in_pcbladdr() -> %d\n", err);
 				return err;
-
+			}
 			e->e_local.l_in = *&laddr4;
 		}
 
@@ -2962,6 +2926,8 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 		udp = (struct udphdr *)(mtod(m, caddr_t) + sizeof(*ip6));
 
 	} else {
+		kdb_backtrace();
+		printf("%s bad family\n", __func__);
 		return EAFNOSUPPORT;
 	}
 
@@ -2988,7 +2954,6 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 	int packet_needs_cookie;
 	int under_load;
 
-	DPRINTF(sc, "Receiving handshake packet\n");
 	if (*mtod(m, uint32_t *) == WG_PKT_COOKIE) {
 		DPRINTF(sc, "Receiving cookie response\n");
 		wg_cookie_message_consume(mtod(m, struct wg_pkt_cookie *), sc);
@@ -3074,38 +3039,97 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 free:
 	wg_m_freem(m);
 }
-#ifdef notyet
+
+static int
+noise_timer_expired(struct timespec *birthdate, time_t sec, long nsec)
+{
+	struct timespec time;
+	struct timespec diff = { .tv_sec = sec, .tv_nsec = nsec };
+
+	getnanotime(&time);
+	timespecsub(&time, &diff, &time);
+	return timespeccmp(birthdate, &time, <) ? ETIMEDOUT : 0;
+}
+
+static uint64_t
+noise_keypair_counter_send(struct noise_keypair *kp)
+{
+	return atomic_fetchadd_long(&kp->k_counter.c_send, 1);
+}
+
+static int
+noise_keypair_encrypt(struct noise_keypair *kp, uint8_t *buf, size_t len, uint64_t *nonce)
+{
+	uint64_t ctr;
+
+	NET_EPOCH_ASSERT();
+
+	if (kp->k_state != KEYPAIR_INITIATOR &&
+	    kp->k_state != KEYPAIR_RESPONDER)
+		return ENOTCONN;
+
+	if (noise_timer_expired(&kp->k_birthdate, REJECT_AFTER_TIME, 0) ||
+	    kp->k_counter.c_recv >= REJECT_AFTER_MESSAGES ||
+	    ((ctr = noise_keypair_counter_send(kp)) > REJECT_AFTER_MESSAGES))
+		return ETIMEDOUT;
+
+	*nonce = htole64(ctr);
+
+	chacha20poly1305_encrypt(buf, buf, len, NULL, 0, *nonce, kp->k_send);
+
+	return 0;
+}
+
+static void
+m_calchdrlen(struct mbuf *m)
+{
+       struct mbuf *n;
+       int plen = 0;
+
+       MPASS(m->m_flags & M_PKTHDR);
+       for (n = m; n; n = n->m_next)
+               plen += n->m_len;
+       m->m_pkthdr.len = plen;
+}
+
 struct wg_peer *
 wg_queue_pkt_encrypt(struct wg_queue_pkt *pkt)
 {
 	struct wg_pkt_data *data;
-	size_t padding_len, plaintext_len;
-	struct mbuf *m = pkt->p_pkt;
-	void *cl;
-	struct wg_peer *peer = wg_peer_ref(pkt->p_keypair->k_peer);
+	size_t padding_len, plaintext_len, out_len;
+	struct noise_keypair *kp;
+	struct mbuf *mc, *m = pkt->p_pkt;
+	struct wg_peer *peer;
+
+	NET_EPOCH_ASSERT();
+	peer = pkt->p_keypair->k_peer;
+	kp = peer->p_keypairs.kp_current_keypair;
 
 	padding_len = WG_PADDING_SIZE(m->m_pkthdr.len);
 	plaintext_len = m->m_pkthdr.len + padding_len;
+	out_len = sizeof(struct wg_pkt_data) + plaintext_len + WG_MAC_SIZE;
 
-    cl = m_cljget(NULL, M_WAITOK,
-		     sizeof(struct wg_pkt_data) + plaintext_len + WG_MAC_SIZE);
-	memcpy(cl, m->m_data, m->m_len);
-	M_MOVE_PKTHDR(mc, m);
-	mc->m_len = sizeof(struct wg_pkt_data) +
-		m->m_pkthdr.len + padding_len + WG_MAC_SIZE;
-	m_calchdrlen(mc);
+	if ((mc = m_getjcl(M_NOWAIT, MT_DATA, M_PKTHDR, MCLBYTES)) == NULL) {
+		pkt->p_state = WG_PKT_STATE_DEAD;
+		goto error;
+	}
 
 	data = mtod(mc, struct wg_pkt_data *);
 	m_copydata(m, 0, m->m_pkthdr.len, data->buf);
 	bzero(data->buf + m->m_pkthdr.len, padding_len);
 
 	data->header.type = WG_PKT_DATA;
-	data->receiver_index = pkt->p_keypair->k_remote_index;
-	data->nonce = htole64(pkt->p_nonce);
+	data->receiver_index = kp->k_remote_index;
 
-	chacha20poly1305_encrypt(data->buf, data->buf, plaintext_len, NULL, 0,
-				 data->nonce, pkt->p_keypair->k_send);
-	noise_keypair_put(pkt->p_keypair);
+	if (noise_keypair_encrypt(kp, data->buf, plaintext_len, &data->nonce) != 0) {
+		pkt->p_state = WG_PKT_STATE_DEAD;
+		m_freem(mc);
+		goto error;
+	}
+
+	M_MOVE_PKTHDR(mc, m);
+	mc->m_len = out_len;
+	m_calchdrlen(mc);
 
 	wg_peer_timers_any_authenticated_packet_traversal(peer);
 	wg_peer_timers_any_authenticated_packet_sent(peer);
@@ -3119,17 +3143,9 @@ wg_queue_pkt_encrypt(struct wg_queue_pkt *pkt)
 
 	wg_m_freem(m);
 	pkt->p_pkt = mc;
-
+ error:
 	return peer;
 }
-#else
-struct wg_peer *
-wg_queue_pkt_encrypt(struct wg_queue_pkt *pkt)
-{
-	UNIMPLEMENTED();
-	return NULL;
-}
-#endif
 
 struct wg_peer *
 wg_queue_pkt_decrypt(struct wg_queue_pkt *pkt)
@@ -3140,7 +3156,6 @@ wg_queue_pkt_decrypt(struct wg_queue_pkt *pkt)
 	struct noise_keypair *keypair;
 	size_t plaintext_len;
 	uint8_t version;
-
 
 	NET_EPOCH_ASSERT();
 	data = mtod(m, struct wg_pkt_data *);
@@ -3218,9 +3233,10 @@ void
 wg_softc_handshake_receive(struct wg_softc *sc)
 {
 	struct mbuf *m;
-	DPRINTF(sc, "receiving handshake\n");
-	while ((m = mbufq_dequeue(&sc->sc_handshake_queue)) != NULL)
+	while ((m = mbufq_dequeue(&sc->sc_handshake_queue)) != NULL) {
+		verify_endpoint(m);
 		wg_receive_handshake_packet(sc, m);
+	}
 }
 
 void
@@ -3228,11 +3244,15 @@ wg_softc_decrypt(struct wg_softc *sc)
 {
 	struct wg_queue_pkt *p;
 	struct wg_peer *peer;
+	struct epoch_tracker et;
+
+	NET_EPOCH_ENTER(et);
 	while ((p = wg_pktq_parallel_dequeue(&sc->sc_decrypt_queue)) != NULL) {
 		peer = wg_queue_pkt_decrypt(p);
 		wg_pktq_pkt_done(p);
 		GROUPTASK_ENQUEUE(&peer->p_recv);
 	}
+	NET_EPOCH_EXIT(et);
 }
 
 void
@@ -3240,11 +3260,23 @@ wg_softc_encrypt(struct wg_softc *sc)
 {
 	struct wg_queue_pkt *p;
 	struct wg_peer *peer;
+	struct epoch_tracker et;
+
+	NET_EPOCH_ENTER(et);
 	while ((p = wg_pktq_parallel_dequeue(&sc->sc_encrypt_queue)) != NULL) {
+#ifdef INVARIANTS
+		struct wg_endpoint *e;
+
+		peer = p->p_keypair->k_peer;
+		e = wg_mbuf_endpoint_get(p->p_pkt);
+		printf("endpoint: %48D\n", e, ":");
+		MPASS(peer->p_endpoint.e_remote.r_sa.sa_family != 0);
+#endif
 		peer = wg_queue_pkt_encrypt(p);
 		wg_pktq_pkt_done(p);
 		GROUPTASK_ENQUEUE(&peer->p_send);
 	}
+	NET_EPOCH_EXIT(et);
 }
 
 #if 0
@@ -3318,7 +3350,7 @@ wg_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *sa,
 		return EDESTADDRREQ;
 	}
 
-	pkt = wg_mbuf_pkt_get(&m);
+	pkt = wg_mbuf_pkt_get(m);
 
 	if (pkt->p_state != WG_PKT_STATE_NEW) {
 		DPRINTF(sc, "Dropping packet as wg-over-wg is not supported\n");
@@ -3351,6 +3383,7 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 {
 	struct wg_queue_pkt *pkt;
 	struct wg_pkt_data *pkt_data;
+	struct wg_endpoint *e;
 	struct wg_softc *sc = _sc;
 	struct udphdr *uh;
 	struct mbuf *m;
@@ -3373,12 +3406,15 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 	data = mtod(m, void *);
 	hdr = mtod(m, struct wg_pkt_header *);
 	pkttype = hdr->type;
-	pkt = wg_mbuf_pkt_get(&m);
+	pkt = wg_mbuf_pkt_get(m);
 	if (pkt == NULL) {
 		DPRINTF(sc, "no pkt\n");
 		goto free;
 	}
 	pkt->p_state = WG_PKT_STATE_CRYPTED;
+	e = wg_mbuf_endpoint_get(m);
+	e->e_remote.r_sa = *srcsa;
+	verify_endpoint(m);
 
 	if_inc_counter(sc->sc_ifp, IFCOUNTER_IPACKETS, 1);
 	if_inc_counter(sc->sc_ifp, IFCOUNTER_IBYTES, m->m_pkthdr.len);
@@ -3391,9 +3427,10 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 		 pkttype == WG_PKT_RESPONSE) ||
 		(pktlen == sizeof(struct wg_pkt_cookie) &&
 		 pkttype == WG_PKT_COOKIE)) {
-		if (mbufq_enqueue(&sc->sc_handshake_queue, m) == 0)
+		verify_endpoint(m);
+		if (mbufq_enqueue(&sc->sc_handshake_queue, m) == 0) {
 			GROUPTASK_ENQUEUE(&sc->sc_handshake);
-		else
+		} else
 			DPRINTF(sc, "Dropping handshake packet\n");
 	} else if (pktlen >= sizeof(struct wg_pkt_data) + WG_MAC_SIZE
 	    && pkttype == WG_PKT_DATA) {
@@ -3411,6 +3448,8 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 			noise_keypair_put(pkt->p_keypair);
 			wg_m_freem(m);
 		} else {
+			DPRINTF(sc, "enqueueing for decrypt\n");
+			printf("kp endpoint: %48D\n", &pkt->p_keypair->k_peer->p_endpoint, ":");
 			wg_pktq_enqueue(&sc->sc_decrypt_queue,
 					&pkt->p_keypair->k_peer->p_recv_queue,
 					pkt);

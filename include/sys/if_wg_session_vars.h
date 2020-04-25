@@ -69,6 +69,7 @@
 #define HASHTABLE_PEER_SIZE		(1 << 6)			//1 << 11
 #define HASHTABLE_INDEX_SIZE		(HASHTABLE_PEER_SIZE * 3)	//1 << 13
 
+struct wg_softc;
 
 #if __FreeBSD_version > 1300000
 typedef void timeout_t (void *);
@@ -98,6 +99,9 @@ struct wg_socket {
 
 
 /* Packet */
+
+void	wg_softc_decrypt(struct wg_softc *);
+void	wg_softc_encrypt(struct wg_softc *);
 
 /* First byte indicating packet type on the wire */
 #define WG_PKT_INITIATION htole32(1)
@@ -168,7 +172,15 @@ struct wg_pktq {
 	STAILQ_HEAD(, wg_queue_pkt)	q_items;
 };
 
+#define MTAG_WIREGUARD 0xBEAD
+struct wg_tag {
+	struct m_tag wt_tag;
+	struct wg_endpoint wt_endpoint;
+	struct wg_queue_pkt wt_queue_pkt;
+};
+
 void		 	 wg_pktq_init(struct wg_pktq *, const char *);
+void		 	 wg_pktq_deinit(struct wg_pktq *);
 void		 	 wg_pktq_enqueue(struct wg_pktq *parallel, struct
 		wg_pktq *serial, struct wg_queue_pkt *);
 struct wg_queue_pkt	*wg_pktq_parallel_dequeue(struct wg_pktq *);

@@ -139,10 +139,18 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	sc->sc_ifp = iflib_get_ifp(ctx);
 
 	mbufq_init(&sc->sc_handshake_queue, MAX_QUEUED_INCOMING_HANDSHAKES);
+	wg_pktq_init(&sc->sc_encrypt_queue, "encryptq");
+	wg_pktq_init(&sc->sc_decrypt_queue, "decryptq");
 	GROUPTASK_INIT(&sc->sc_handshake, 0,
 	    (gtask_fn_t *)wg_softc_handshake_receive, sc);
 	taskqgroup_attach(qgroup_if_io_tqg, &sc->sc_handshake, sc, dev, NULL, "wg tx initiation");
-nvl_out:
+	GROUPTASK_INIT(&sc->sc_encrypt, 0,
+	    (gtask_fn_t *)wg_softc_encrypt, sc);
+	taskqgroup_attach(qgroup_if_io_tqg, &sc->sc_encrypt, sc, dev, NULL, "wg encrypt");
+	GROUPTASK_INIT(&sc->sc_decrypt, 0,
+	    (gtask_fn_t *)wg_softc_decrypt, sc);
+	taskqgroup_attach(qgroup_if_io_tqg, &sc->sc_decrypt, sc, dev, NULL, "wg decrypt");
+ nvl_out:
 	nvlist_destroy(nvl);
 out:
 	free(packed, M_TEMP);
@@ -242,7 +250,13 @@ wg_detach(if_ctx_t ctx)
 	//sc->wg_accept_port = 0;
 	wg_socket_reinit(sc, NULL, NULL);
 	wg_peer_remove_all(sc);
+	wg_pktq_deinit(&sc->sc_encrypt_queue);
+	wg_pktq_deinit(&sc->sc_decrypt_queue);
+
 	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_handshake);
+	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_encrypt);
+	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_decrypt);
+
 	rw_destroy(&sc->sc_local.l_lock);
 	atomic_add_int(&clone_count, -1);
 
