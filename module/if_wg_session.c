@@ -43,6 +43,7 @@
 #include <sys/if_wg_session.h>
 #include <sys/if_wg_session_vars.h>
 #include <sys/wg_module.h>
+#include <sys/syslog.h>
 
 #include <netinet/in.h>
 #include <netinet/in_var.h>
@@ -313,14 +314,17 @@ callout_del(struct callout *c)
 static inline void
 wg_m_freem_(struct mbuf *m, char *file, int line)
 {
-	printf("freeing m=%p at %s:%d\n", m, file, line);
 	m_freem(m);
 }
 
 #define wg_m_freem(m) wg_m_freem_((m), __FILE__, __LINE__)
 
+/*
+ * Magic values baked in to handshake protocol
+ */
 static const uint8_t handshake_name[37] = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 static const u8 identifier_name[34] = "WireGuard v1 zx2c4 Jason@zx2c4.com";
+
 static __read_mostly uint8_t handshake_init_hash[NOISE_HASH_LEN];
 static __read_mostly uint8_t handshake_init_chaining_key[NOISE_HASH_LEN];
 //static atomic64_t keypair_counter = ATOMIC64_INIT(0);
@@ -354,6 +358,23 @@ wg_counter_next(struct wg_counter *ctr)
 	ret = ctr->c_send++;
 	mtx_unlock(&ctr->c_mtx);
 	return ret;
+}
+
+static void
+wg_peer_magic_set(struct wg_peer *peer)
+{
+	peer->p_magic_1 = PEER_MAGIC1;
+	peer->p_magic_2 = PEER_MAGIC2;
+	peer->p_magic_3 = PEER_MAGIC3;
+
+}
+
+static void
+verify_peer_magic(struct wg_peer *peer)
+{
+	MPASS(peer->p_magic_1 == PEER_MAGIC1);
+	MPASS(peer->p_magic_2 == PEER_MAGIC2);
+	MPASS(peer->p_magic_3 == PEER_MAGIC3);
 }
 
 int
@@ -619,7 +640,8 @@ wg_socket_send_mbuf(struct wg_socket *so, struct mbuf *m, uint16_t family)
 			break;
 		}
 	}
-	printf("ip_output()->%d\n", err);
+	if (err)
+		log(LOG_WARNING, "ip_output()->%d\n", err);
 	CURVNET_RESTORE();
 	return (err);
 }
@@ -1057,21 +1079,18 @@ wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
 	cidr = &route->r_cidr;
 
 	RADIX_NODE_HEAD_LOCK(root);
-	printf("addaddr(%16D, %16D)\n",
-		   &cidr->a_addr, ":", &cidr->a_mask, ":");
+	//	printf("addaddr(%16D, %16D)\n",
+	//		   &cidr->a_addr, ":", &cidr->a_mask, ":");
 	node = root->rnh_addaddr(&cidr->a_addr, &cidr->a_mask, &root->rh,
 							route->r_nodes);
 	if (node == route->r_nodes) {
 		tbl->t_count++;
 		CK_LIST_INSERT_HEAD(&peer->p_routes, route, r_entry);
 	} else {
-		printf("need free of route\n");
-
 		needfree = true;
 	}
 	RADIX_NODE_HEAD_UNLOCK(root);
 	if (needfree) {
-		printf("freing route 1\n");
 		free(route, M_WG);
 	}
 	return (0);
@@ -1124,7 +1143,6 @@ wg_route_delete(struct wg_route_table *tbl, struct wg_peer *peer,
 	}
 	RADIX_NODE_HEAD_UNLOCK(root);
 	if (needfree) {
-		printf("freing route 2\n");
 		free(route, M_WG);
 	}
 	return ret;
@@ -1175,8 +1193,6 @@ wg_route_lookup(struct wg_route_table *tbl, struct mbuf *m,
 		addr = &sin6;
 	} else
 		return (NULL);
-	printf("matchaddr(%16D)\n",
-		   addr, ":");
 
 	RADIX_NODE_HEAD_RLOCK(root);
 	if ((node = root->rnh_matchaddr(addr, &root->rh)) != NULL) {
@@ -1387,7 +1403,6 @@ noise_keypair_attach_to_peer(struct noise_keypair *keypair,
 
 	DPRINTF(keypair->k_peer->p_sc, "Keypair %lu created for peer %lu\n",
 		keypair->k_id, keypair->k_peer->p_id);
-	printf("kp endpoint: %48D\n", &peer->p_endpoint, ":");
 }
 
 struct noise_keypair *
@@ -1699,7 +1714,6 @@ noise_message_encrypt(uint8_t *dst, const uint8_t *src, size_t src_len,
 	/* Nonce always zero for Noise_IK */
 	chacha20poly1305_encrypt(dst, src, src_len, hash, WG_HASH_SIZE, 0, key);
 	noise_mix_hash(hash, dst, src_len + WG_MAC_SIZE);
-	printf("noise_message_encrypt - hash: %32D\n", hash, ":");
 }
 
 int
@@ -1823,10 +1837,6 @@ noise_handshake_consume_initiation(struct wg_pkt_initiation *src,
 	rw_rlock(&sc->sc_local.l_lock);
 	if (!sc->sc_local.l_has_identity)
 		goto out;
-
-	printf("header: %x sender_index %x ephem: %32D\n static: %48D\n",
-		   src->header.type, src->sender_index, src->unencrypted_ephemeral, "",
-		   src->encrypted_static, "");
 
 	handshake_init(chaining_key, hash, sc->sc_local.l_public);
 
@@ -2191,15 +2201,10 @@ wg_cookie_validate_packet(struct wg_cookie_checker *checker, struct mbuf *m,
 	struct wg_pkt_macs *macs = (struct wg_pkt_macs *)
 		(mtod(m, uint8_t *) + m->m_pkthdr.len - sizeof(*macs));
 
-	printf("pktlen=%d\n", m->m_pkthdr.len);
-	printf("pkt:\n%148D\n", mtod(m, uint8_t *), ":");
 	mtx_lock(&checker->cc_mtx);
 	wg_compute_mac1(computed_mac, mtod(m, uint8_t *), m->m_pkthdr.len,
 	    checker->cc_message_mac1_key);
 	if (timingsafe_bcmp(computed_mac, macs->mac1, WG_COOKIE_SIZE)) {
-		printf("computed %16D\n", computed_mac, ":");
-		printf("got        %16D\n", macs->mac1, ":");
-		printf("MAC  1 mismatch\n");
 		goto out;
 	}
 	ret = VALID_MAC_BUT_NO_COOKIE;
@@ -2213,12 +2218,10 @@ wg_cookie_validate_packet(struct wg_cookie_checker *checker, struct mbuf *m,
 	wg_compute_mac2(computed_mac, mtod(m, uint8_t *), m->m_pkthdr.len,
 	    cookie);
 	if (timingsafe_bcmp(computed_mac, macs->mac2, WG_COOKIE_SIZE)) {
-		printf("MAC  2 mismatch\n");
 		goto out;
 	}
 	ret = VALID_MAC_WITH_COOKIE_BUT_RATELIMITED;
 	if (wg_ratelimiter_allow(NULL, m) != 0) {
-		printf("ratelimiter reject\n");
 		goto out;
 	}
 	ret = VALID_MAC_WITH_COOKIE;
@@ -2354,6 +2357,7 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 
 	noise_remote_init(&peer->p_remote, wpci->wpci_pub_key);
 
+	wg_peer_magic_set(peer);
 	wg_cookie_init(&peer->p_cookie);
 	wg_cookie_precompute_peer_keys(peer);
 	wg_peer_timers_init(peer);
@@ -2387,6 +2391,7 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	peer->p_sc = sc;
 	DPRINTF(sc, "Peer %lu created\n", peer->p_id);
 	MPASS(sc->sc_hashtable.h_num_peers > 0);
+	verify_peer_magic(peer);
 	return (0);
 }
 
@@ -2824,6 +2829,39 @@ wg_mbuf_pkt_get(struct mbuf *m)
 	return (&hdr->wt_queue_pkt);
 }
 
+static int
+wg_laddr_v4(struct inpcb *inp, struct in_addr *laddr4, struct wg_endpoint *e)
+{
+	int err;
+
+	if (e->e_local.l_in.s_addr == INADDR_ANY) {
+			CURVNET_SET(inp->inp_vnet);
+			err = in_pcbladdr(inp, &e->e_remote.r_sin.sin_addr, laddr4, curthread->td_ucred);
+			CURVNET_RESTORE();
+			if (err != 0) {
+				printf("in_pcbladdr() -> %d\n", err);
+				return err;
+			}
+			e->e_local.l_in = *laddr4;
+		}
+		return (0);
+}
+
+static int
+wg_laddr_v6(struct inpcb *inp, struct in6_addr *laddr6, struct wg_endpoint *e)
+{
+	int err;
+
+		if (IN6_IS_ADDR_UNSPECIFIED(&e->e_local.l_in6)) {
+			err = in6_selectsrc_addr(0, &e->e_remote.r_sin6.sin6_addr, 0,
+									 NULL, laddr6, NULL);
+			if (err != 0)
+				return err;
+			e->e_local.l_in6 = *laddr6;
+		}
+		return (0);
+}
+
 int
 wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 {
@@ -2841,7 +2879,6 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 	in_port_t rport;
 	uint8_t  pr;
 
-	printf("endpoint: %48D\n", e, ":");
 	MPASS(len > 0);
 	MPASS(m->m_len > 0);
 	td = curthread;
@@ -2863,20 +2900,8 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 		ip4->ip_ttl	= 127;
 		ip4->ip_p	= IPPROTO_UDP;
 
-		if (e->e_local.l_in.s_addr == INADDR_ANY) {
-			if (inp->inp_route.ro_rt != NULL) {
-				rtfree(inp->inp_route.ro_rt);
-				inp->inp_route.ro_rt = NULL;
-			}
-			CURVNET_SET(inp->inp_vnet);
-			err = in_pcbladdr(inp, &e->e_remote.r_sin.sin_addr, &laddr4, td->td_ucred);
-			CURVNET_RESTORE();
-			if (err != 0) {
-				printf("in_pcbladdr() -> %d\n", err);
-				return err;
-			}
-			e->e_local.l_in = *&laddr4;
-		}
+		if ((err = wg_laddr_v4(inp, &laddr4, e)))
+			return (err);
 
 		ip4->ip_src	= e->e_local.l_in;
 		ip4->ip_dst	= e->e_remote.r_sin.sin_addr;
@@ -2906,15 +2931,8 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 		ip6->ip6_nxt	 = IPPROTO_UDP;
 		ip6->ip6_hlim	 = in6_selecthlim(inp, NULL);
 
-		if (IN6_IS_ADDR_UNSPECIFIED(&e->e_local.l_in6)) {
-			rtfree(inp->inp_route.ro_rt);
-			inp->inp_route.ro_rt = NULL;
-			err = in6_selectsrc_addr(0, &e->e_remote.r_sin6.sin6_addr, 0,
-									 NULL, &laddr6, NULL);
-			if (err != 0)
-				return err;
-			e->e_local.l_in6 = *&laddr6;
-		}
+		if ((err = wg_laddr_v6(inp, &laddr6, e)))
+			return (err);
 
 		ip6->ip6_src	 = e->e_local.l_in6;
 		/* ip6->ip6_dst	 = e->e_remote.r_sin6.sin6_addr; */
@@ -3105,6 +3123,8 @@ wg_queue_pkt_encrypt(struct wg_queue_pkt *pkt)
 	peer = pkt->p_keypair->k_peer;
 	kp = peer->p_keypairs.kp_current_keypair;
 
+	verify_peer_magic(peer);
+
 	padding_len = WG_PADDING_SIZE(m->m_pkthdr.len);
 	plaintext_len = m->m_pkthdr.len + padding_len;
 	out_len = sizeof(struct wg_pkt_data) + plaintext_len + WG_MAC_SIZE;
@@ -3269,7 +3289,6 @@ wg_softc_encrypt(struct wg_softc *sc)
 
 		peer = p->p_keypair->k_peer;
 		e = wg_mbuf_endpoint_get(p->p_pkt);
-		printf("endpoint: %48D\n", e, ":");
 		MPASS(peer->p_endpoint.e_remote.r_sa.sa_family != 0);
 #endif
 		peer = wg_queue_pkt_encrypt(p);
@@ -3391,12 +3410,9 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 	struct wg_pkt_header *hdr;
 	void *data;
 
-	DPRINTF(sc, "%s(%p, %d, %p, %p, %p)\n",
-			__func__, m0, offset, inpcb, srcsa, _sc);
 	uh = (struct udphdr *)(m0->m_data + offset);
 	hlen = offset + sizeof(struct udphdr);
 
-	printf("offset=%d hlen=%d\n", offset, hlen);
 	m_adj(m0, hlen);
 
 	if ((m = m_defrag(m0, M_NOWAIT)) == NULL) {
@@ -3420,7 +3436,6 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 	if_inc_counter(sc->sc_ifp, IFCOUNTER_IBYTES, m->m_pkthdr.len);
 	pktlen = m->m_pkthdr.len;
 
-	DPRINTF(sc, "pktlen=%d pkttype=%d\n", pktlen, pkttype);
 	if ((pktlen == sizeof(struct wg_pkt_initiation) &&
 		 pkttype == WG_PKT_INITIATION) ||
 		(pktlen == sizeof(struct wg_pkt_response) &&
@@ -3448,8 +3463,6 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 			noise_keypair_put(pkt->p_keypair);
 			wg_m_freem(m);
 		} else {
-			DPRINTF(sc, "enqueueing for decrypt\n");
-			printf("kp endpoint: %48D\n", &pkt->p_keypair->k_peer->p_endpoint, ":");
 			wg_pktq_enqueue(&sc->sc_decrypt_queue,
 					&pkt->p_keypair->k_peer->p_recv_queue,
 					pkt);

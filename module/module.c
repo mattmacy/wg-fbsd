@@ -66,7 +66,7 @@ __FBSDID("$FreeBSD$");
 MALLOC_DEFINE(M_WG, "WG", "wireguard");
 
 #define WG_CAPS														\
-	IFCAP_TSO |IFCAP_HWCSUM | IFCAP_VLAN_HWFILTER | IFCAP_VLAN_HWTAGGING | IFCAP_VLAN_HWCSUM |	\
+	IFCAP_HWCSUM | IFCAP_VLAN_HWFILTER | IFCAP_VLAN_HWTAGGING | IFCAP_VLAN_HWCSUM |	\
 	IFCAP_VLAN_MTU | IFCAP_TXCSUM_IPV6 | IFCAP_HWCSUM_IPV6 | IFCAP_JUMBO_MTU | IFCAP_LINKSTATE
 TASKQGROUP_DECLARE(if_io_tqg);
 
@@ -166,7 +166,6 @@ wg_transmit(struct ifnet *ifp, struct mbuf *m)
 	struct wg_peer *peer;
 	int rc;
 
-	printf("%s(%p, %p)\n", __func__, ifp, m);
 	rc = 0;
 	sc = iflib_get_softc(ifp->if_softc);
 	ETHER_BPF_MTAP(ifp, m);

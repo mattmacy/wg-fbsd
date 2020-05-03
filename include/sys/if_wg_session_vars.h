@@ -69,6 +69,10 @@
 #define HASHTABLE_PEER_SIZE		(1 << 6)			//1 << 11
 #define HASHTABLE_INDEX_SIZE		(HASHTABLE_PEER_SIZE * 3)	//1 << 13
 
+#define PEER_MAGIC1	0xCAFEBABEB00FDADDULL
+#define PEER_MAGIC2	0xCAAFD0D0D00DBABEULL
+#define PEER_MAGIC3	0xD00DBABEF00DFADEULL
+
 struct wg_softc;
 
 #if __FreeBSD_version > 1300000
@@ -348,6 +352,7 @@ struct wg_peer_create_info {
 };
 
 struct wg_peer {
+	uint64_t p_magic_1;
 	CK_LIST_ENTRY(wg_peer)	 p_hash_entry;
 	CK_LIST_ENTRY(wg_peer)	 p_entry;
 	uint64_t		 p_id;
@@ -361,6 +366,8 @@ struct wg_peer {
 
 	struct rwlock		 p_endpoint_lock;
 	struct wg_endpoint	 p_endpoint;
+
+	uint64_t p_magic_2;
 
 	struct mbufq	 p_staged_packets;
 	struct grouptask		 p_send_staged;
@@ -376,6 +383,7 @@ struct wg_peer {
 	counter_u64_t		 p_rx_bytes;
 
 	CK_LIST_HEAD(, wg_route)	 p_routes;
+	uint64_t p_magic_3;
 	struct mtx p_lock;
 	struct epoch_context p_ctx;
 };
