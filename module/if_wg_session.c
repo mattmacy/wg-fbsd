@@ -187,7 +187,6 @@ struct noise_keypair *
 int	noise_keypairs_begin_session(struct noise_keypairs *);
 int	noise_keypairs_received_with_keypair(struct noise_keypairs *,
 					     struct noise_keypair *);
-void	noise_keypairs_keep_key_fresh_send(struct noise_keypairs *);
 void	noise_keypairs_keep_key_fresh_recv(struct noise_keypairs *);
 
 void	noise_kdf(uint8_t *, uint8_t *, uint8_t *, const uint8_t *, size_t,
@@ -835,12 +834,13 @@ wg_peer_timers_handshake_initiated(struct wg_peer *peer)
 void
 wg_peer_timers_handshake_complete(struct wg_peer *peer)
 {
-	rw_wlock(&peer->p_timers.t_lock);
-	if (callout_del(&peer->p_timers.t_retransmit_handshake))
+	struct wg_timers *t = &peer->p_timers;
+
+	if (callout_del(&t->t_retransmit_handshake))
 		wg_peer_put(peer);
-	peer->p_timers.t_handshake_attempts = 0;
-	getnanotime(&peer->p_timers.t_last_handshake);
-	rw_wunlock(&peer->p_timers.t_lock);
+	t->t_handshake_attempts = 0;
+	t->t_sent_lastminute_handshake = false;
+	getnanotime(&t->t_last_handshake);
 }
 
 /*
@@ -877,32 +877,16 @@ wg_peer_timers_any_authenticated_packet_traversal(struct wg_peer *peer)
 void
 wg_peer_timers_init(struct wg_peer *peer)
 {
-	rw_init(&peer->p_timers.t_lock, "wg_peer_timers");
+	struct wg_timers *t = &peer->p_timers;
 
-	callout_init(&peer->p_timers.t_retransmit_handshake, true);
-	callout_init(&peer->p_timers.t_send_keepalive, true);
-	callout_init(&peer->p_timers.t_new_handshake, true);
-	callout_init(&peer->p_timers.t_zero_key_material, true);
-	callout_init(&peer->p_timers.t_persistent_keepalive, true);
-#if 0	
-	timeout_set_proc(&peer->p_timers.t_retransmit_handshake,
-	     (void (*)(void *))wg_peer_expired_retransmit_handshake, peer);
-	timeout_set_proc(&peer->p_timers.t_send_keepalive,
-	     (void (*)(void *))wg_peer_expired_send_keepalive, peer);
-	timeout_set_proc(&peer->p_timers.t_new_handshake,
-	     (void (*)(void *))wg_peer_expired_new_handshake, peer);
-	timeout_set_proc(&peer->p_timers.t_zero_key_material,
-	     (void (*)(void *))wg_peer_expired_zero_key_material, peer);
-	timeout_set_proc(&peer->p_timers.t_persistent_keepalive,
-	     (void (*)(void *))wg_peer_expired_send_persistent_keepalive, peer);
-#endif
-	peer->p_timers.t_persistent_keepalive_interval = 0;
-	peer->p_timers.t_handshake_attempts = 0;
-	peer->p_timers.t_need_another_keepalive = 0;
-	bzero(&peer->p_timers.t_last_handshake,
-	    sizeof(peer->p_timers.t_last_handshake));
-	bzero(&peer->p_timers.t_last_sent_handshake,
-	    sizeof(peer->p_timers.t_last_sent_handshake));
+	bzero(t, sizeof(*t));
+
+	rw_init(&peer->p_timers.t_lock, "wg_peer_timers");
+	callout_init(&t->t_retransmit_handshake, true);
+	callout_init(&t->t_send_keepalive, true);
+	callout_init(&t->t_new_handshake, true);
+	callout_init(&t->t_zero_key_material, true);
+	callout_init(&t->t_persistent_keepalive, true);
 }
 
 void
@@ -1574,20 +1558,27 @@ noise_keypairs_received_with_keypair(struct noise_keypairs *keypairs,
 	return 0;
 }
 
-void
-noise_keypairs_keep_key_fresh_send(struct noise_keypairs *keypairs)
+static void
+noise_keypairs_keep_key_fresh_send(struct wg_peer *peer)
 {
+	struct wg_timers *t;
 	struct noise_keypair *keypair;
+	struct epoch_tracker et;
+	bool send = false;
 
-	mtx_lock(&keypairs->kp_mtx);
-	keypair = keypairs->kp_current_keypair;
+	t = &peer->p_timers;
+	NET_EPOCH_ENTER(et);
+	keypair = peer->p_keypairs.kp_current_keypair;
 
 	if (keypair != NULL &&
 	    (keypair->k_counter.c_send > REKEY_AFTER_MESSAGES ||
 	     (keypair->k_state == KEYPAIR_INITIATOR &&
 	      wg_timers_expired(&keypair->k_birthdate, REKEY_AFTER_TIME, 0))))
-		wg_peer_queue_handshake_initiation(keypair->k_peer, 0);
-	mtx_unlock(&keypairs->kp_mtx);
+		send = true;
+	NET_EPOCH_EXIT(et);
+
+	if (send)
+		wg_peer_queue_handshake_initiation(peer, false);
 }
 
 void
@@ -1813,7 +1804,7 @@ noise_handshake_create_initiation(struct wg_pkt_initiation *dst,
 
 	noise_keypair_attach_to_peer(keypair, peer);
 
-	dst->header.type = WG_PKT_INITIATION;
+	dst->header.type = htole32(MESSAGE_HANDSHAKE_INITIATION);
 	dst->sender_index = keypair->k_local_index;
 out:
 	explicit_bzero(ss, WG_KEY_SIZE);
@@ -1942,7 +1933,7 @@ noise_handshake_create_response(struct wg_pkt_response *dst,
 	if (keypair->k_state != HANDSHAKE_CONSUMED_INITIATION)
 		goto out;
 
-	dst->header.type = WG_PKT_RESPONSE;
+	dst->header.type = htole32(MESSAGE_HANDSHAKE_RESPONSE);
 	dst->receiver_index = keypair->k_remote_index;
 	dst->sender_index = keypair->k_local_index;
 
@@ -2258,7 +2249,7 @@ wg_cookie_message_create(struct wg_pkt_cookie *dst, struct mbuf *m,
 		(mtod(m, uint8_t *) + m->m_pkthdr.len - sizeof(*macs));
 	uint8_t cookie[WG_COOKIE_SIZE];
 
-	dst->header.type = WG_PKT_COOKIE;
+	dst->header.type = htole32(MESSAGE_HANDSHAKE_COOKIE);
 	dst->receiver_index = index;
 	arc4random_buf(dst->nonce, WG_XNONCE_SIZE);
 
@@ -2675,7 +2666,6 @@ wg_peer_enqueue_buffer(struct wg_peer *peer, void *buf, size_t len)
 	MPASS(m->m_pkthdr.len == len);
 	pkt->p_state = WG_PKT_STATE_CRYPTED;
 
-	printf("enqueueing %p for mbuf %p\n", pkt, m);
 	wg_pktq_serial_enqueue(&peer->p_send_queue, pkt);
 	wg_pktq_pkt_done(pkt);
 	GROUPTASK_ENQUEUE(&peer->p_send);
@@ -2972,7 +2962,7 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 	int packet_needs_cookie;
 	int under_load;
 
-	if (*mtod(m, uint32_t *) == WG_PKT_COOKIE) {
+	if (le32toh(*mtod(m, uint32_t *) )  == MESSAGE_HANDSHAKE_COOKIE) {
 		DPRINTF(sc, "Receiving cookie response\n");
 		wg_cookie_message_consume(mtod(m, struct wg_pkt_cookie *), sc);
 		goto free;
@@ -2997,8 +2987,8 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 		goto free;
 	}
 
-	switch (*mtod(m, uint32_t *)) {
-	case WG_PKT_INITIATION:
+	switch (le32toh(*mtod(m, uint32_t *))) {
+	case MESSAGE_HANDSHAKE_INITIATION:
 		init = mtod(m, struct wg_pkt_initiation *);
 
 		if (packet_needs_cookie) {
@@ -3016,7 +3006,7 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 				keypair->k_peer->p_id);
 		wg_peer_send_handshake_response(keypair->k_peer);
 		break;
-	case WG_PKT_RESPONSE:
+	case MESSAGE_HANDSHAKE_RESPONSE:
 		resp = mtod(m, struct wg_pkt_response *);
 
 		if (packet_needs_cookie) {
@@ -3138,7 +3128,7 @@ wg_queue_pkt_encrypt(struct wg_queue_pkt *pkt)
 	m_copydata(m, 0, m->m_pkthdr.len, data->buf);
 	bzero(data->buf + m->m_pkthdr.len, padding_len);
 
-	data->header.type = WG_PKT_DATA;
+	data->header.type = htole32(MESSAGE_DATA);
 	data->receiver_index = kp->k_remote_index;
 
 	if (noise_keypair_encrypt(kp, data->buf, plaintext_len, &data->nonce) != 0) {
@@ -3156,7 +3146,7 @@ wg_queue_pkt_encrypt(struct wg_queue_pkt *pkt)
 	if (m->m_pkthdr.len > 0)
 		wg_peer_timers_data_sent(peer);
 
-	noise_keypairs_keep_key_fresh_send(&peer->p_keypairs);
+	noise_keypairs_keep_key_fresh_send(peer);
 
 	if (wg_peer_mbuf_add_ipudp(peer, &mc) == 0)
 		pkt->p_state = WG_PKT_STATE_CRYPTED;
@@ -3421,7 +3411,7 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 	}
 	data = mtod(m, void *);
 	hdr = mtod(m, struct wg_pkt_header *);
-	pkttype = hdr->type;
+	pkttype = le32toh(hdr->type);
 	pkt = wg_mbuf_pkt_get(m);
 	if (pkt == NULL) {
 		DPRINTF(sc, "no pkt\n");
@@ -3437,18 +3427,18 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 	pktlen = m->m_pkthdr.len;
 
 	if ((pktlen == sizeof(struct wg_pkt_initiation) &&
-		 pkttype == WG_PKT_INITIATION) ||
+		 pkttype == MESSAGE_HANDSHAKE_INITIATION) ||
 		(pktlen == sizeof(struct wg_pkt_response) &&
-		 pkttype == WG_PKT_RESPONSE) ||
+		 pkttype == MESSAGE_HANDSHAKE_RESPONSE) ||
 		(pktlen == sizeof(struct wg_pkt_cookie) &&
-		 pkttype == WG_PKT_COOKIE)) {
+		 pkttype == MESSAGE_HANDSHAKE_COOKIE)) {
 		verify_endpoint(m);
 		if (mbufq_enqueue(&sc->sc_handshake_queue, m) == 0) {
 			GROUPTASK_ENQUEUE(&sc->sc_handshake);
 		} else
 			DPRINTF(sc, "Dropping handshake packet\n");
 	} else if (pktlen >= sizeof(struct wg_pkt_data) + WG_MAC_SIZE
-	    && pkttype == WG_PKT_DATA) {
+	    && pkttype == MESSAGE_DATA) {
 
 		pkt_data = data;
 		pkt->p_keypair = wg_hashtable_keypair_lookup(&sc->sc_hashtable,

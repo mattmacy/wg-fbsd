@@ -107,12 +107,6 @@ struct wg_socket {
 void	wg_softc_decrypt(struct wg_softc *);
 void	wg_softc_encrypt(struct wg_softc *);
 
-/* First byte indicating packet type on the wire */
-#define WG_PKT_INITIATION htole32(1)
-#define WG_PKT_RESPONSE htole32(2)
-#define WG_PKT_COOKIE htole32(3)
-#define WG_PKT_DATA htole32(4)
-
 struct wg_pkt_header {
 	uint32_t 	type;
 } __packed;
@@ -210,7 +204,9 @@ struct wg_timers {
 	struct callout	t_persistent_keepalive;
 	uint16_t	t_persistent_keepalive_interval;
 	uint8_t		t_handshake_attempts;
-	uint8_t		t_need_another_keepalive;
+	bool		t_need_another_keepalive;
+	bool		t_sent_lastminute_handshake;
+
 	struct timespec	t_last_handshake;
 	struct timespec	t_last_sent_handshake;
 };
