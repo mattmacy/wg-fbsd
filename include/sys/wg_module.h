@@ -5,7 +5,6 @@
 #include <sys/socket.h>
 #include <net/if.h>
 #include <net/if_var.h>
-#include <net/ethernet.h>
 #include <sys/support.h>
 
 
@@ -13,24 +12,14 @@
 #include <sys/epoch.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/ip6.h>
 
 
-#include <net/iflib.h>
 
 #include <crypto/curve25519.h>
 #include <zinc/chacha20poly1305.h>
 #include <crypto/blake2s.h>
 
 MALLOC_DECLARE(M_WG);
-
-
-typedef struct {
-	uint64_t	k0;
-	uint64_t	k1;
-} SIPHASH_KEY;
 
 
 enum noise_lengths {
@@ -50,19 +39,10 @@ enum cookie_values {
 	COOKIE_LEN = 16
 };
 
-enum counter_values {
-	COUNTER_BITS_TOTAL = 2048,
-	COUNTER_REDUNDANT_BITS = __LONG_BIT,
-	COUNTER_WINDOW_SIZE = COUNTER_BITS_TOTAL - COUNTER_REDUNDANT_BITS
-};
-
 enum limits {
-	REKEY_AFTER_MESSAGES = 1ULL << 60,
-	REJECT_AFTER_MESSAGES = __UQUAD_MAX - COUNTER_WINDOW_SIZE - 1,
+	//	REJECT_AFTER_MESSAGES = __UQUAD_MAX - COUNTER_WINDOW_SIZE - 1,
 	REKEY_TIMEOUT = 5,
 	//REKEY_TIMEOUT_JITTER_MAX_JIFFIES = HZ / 3,
-	REKEY_AFTER_TIME = 120,
-	REJECT_AFTER_TIME = 180,
 	INITIATIONS_PER_SECOND = 50,
 	MAX_PEERS_PER_DEVICE = 1U << 20,
 	KEEPALIVE_TIMEOUT = 10,
@@ -70,14 +50,6 @@ enum limits {
 	MAX_QUEUED_INCOMING_HANDSHAKES = 4096, /* TODO: replace this with DQL */
 	MAX_STAGED_PACKETS = 128,
 	MAX_QUEUED_PACKETS = 1024 /* TODO: replace this with DQL */
-};
-
-enum message_type {
-	MESSAGE_INVALID = 0,
-	MESSAGE_HANDSHAKE_INITIATION = 1,
-	MESSAGE_HANDSHAKE_RESPONSE = 2,
-	MESSAGE_HANDSHAKE_COOKIE = 3,
-	MESSAGE_DATA = 4
 };
 
 #define zfree(addr, type)						\

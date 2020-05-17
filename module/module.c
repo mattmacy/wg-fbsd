@@ -59,6 +59,7 @@ __FBSDID("$FreeBSD$");
 #endif
 #include <sys/wg_module.h>
 #include <crypto/zinc.h>
+#include <sys/wg_noise.h>
 #include <sys/if_wg_session_vars.h>
 #include <sys/if_wg_session.h>
 
@@ -71,6 +72,7 @@ MALLOC_DEFINE(M_WG, "WG", "wireguard");
 TASKQGROUP_DECLARE(if_io_tqg);
 
 static int clone_count;
+uma_zone_t wg_ratelimit_zone;
 
 static int
 wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t params)
@@ -82,6 +84,7 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	nvlist_t *nvl;
 	void *packed;
 	struct noise_local *local;
+	struct noise_alloc	 local_alloc;
 	int err;
 	uint16_t listen_port;
 	const void *key;
@@ -122,12 +125,17 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 		err = EBADMSG;
 		goto nvl_out;
 	}
-	wg_cookie_checker_init(&sc->sc_cookie_checker);
+
+	local = &sc->sc_local;
+	noise_local_init(local, &local_alloc);
+	cookie_checker_init(&sc->sc_cookie, wg_ratelimit_zone);
 
 	sc->sc_socket.so_port = listen_port;
-	local = &sc->sc_local;
-	noise_local_init(local);
-	noise_local_set_private(local, key);
+	/*
+	 * XXX init local_alloc
+	 */
+
+	noise_local_set_private(local, __DECONST(uint8_t *, key));
 	wg_cookie_checker_precompute_device_keys(sc);
 	
 	atomic_add_int(&clone_count, 1);
@@ -615,8 +623,6 @@ static int
 wg_module_init(void)
 {
 	int rc;
-
-	wg_noise_param_init();
 
 	if ((rc = wg_ctx_init()))
 		return (rc);

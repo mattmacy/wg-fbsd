@@ -74,11 +74,11 @@
 #include <sys/time.h>
 #include <sys/rwlock.h>
 #include <sys/queue.h>
+#include <sys/support.h>
 
 #include <netinet/in.h>
 
 #include <crypto/blake2s.h>
-#include <sys/if_wg_session_vars.h>
 
 #define COOKIE_MAC_SIZE		16
 #define COOKIE_KEY_SIZE		32

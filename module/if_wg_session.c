@@ -34,21 +34,19 @@
 #include <sys/endian.h>
 #include <sys/kdb.h>
 
-#include <net/if.h>
-#include <net/if_var.h>
-#include <net/if_types.h>
-#include <net/pfvar.h>
 #include <net/bpf.h>
+
 
 #include <sys/if_wg_session.h>
 #include <sys/if_wg_session_vars.h>
-#include <sys/wg_module.h>
+//#include <sys/wg_module.h>
 #include <sys/syslog.h>
 
 #include <netinet/in.h>
 #include <netinet/in_var.h>
 #include <netinet/ip.h>
 #include <netinet/ip_var.h>
+#include <netinet/ip6.h>
 #include <netinet6/ip6_var.h>
 #include <netinet6/scope6_var.h>
 #include <netinet/udp.h>
@@ -67,14 +65,38 @@
 	gtaskqueue_drain((gtask)->gt_taskqueue, &(gtask)->gt_task)
 TASKQGROUP_DECLARE(if_io_tqg);
 
-/*
- * m_dat / m_pktdat is inuse for wireguard internal state
- */
-#define	M_DAT_INUSE	M_PROTO1
+struct wg_pkt_initiation {
+	uint32_t		t;
+	struct noise_initiation init;
+	struct cookie_macs	m;
+} __packed;
 
-#define	M_DAT_TYPE_UNUSED	0x0
-#define	M_DAT_TYPE_QPKT	0x1
-#define	M_DAT_TYPE_ENDPOINT	0x2
+struct wg_pkt_response {
+	uint32_t		t;
+	struct noise_response	resp;
+	struct cookie_macs	m;
+} __packed;
+
+struct wg_pkt_cookie {
+	uint32_t		t;
+	uint32_t		r_idx;
+	uint8_t			nonce[COOKIE_XNONCE_SIZE];
+	uint8_t			ec[COOKIE_ENCRYPTED_SIZE];
+} __packed;
+
+struct wg_pkt_data {
+	uint32_t		t;
+	struct noise_data	data;
+} __packed;
+
+#define MTAG_WIREGUARD 0xBEAD
+struct wg_tag {
+	struct m_tag wt_tag;
+	struct wg_endpoint wt_endpoint;
+	struct wg_queue_pkt wt_queue_pkt;
+	struct wg_peer *t_peer;
+	int			 t_done;
+};
 
 #define DPRINTF(sc,  ...) if_printf(sc->sc_ifp, ##__VA_ARGS__)
 
@@ -86,14 +108,6 @@ wg_mtod(struct mbuf *m0)
 
 #undef mtod
 #define	mtod(m, t)	((t)(wg_mtod(m)))
-
-static inline uint64_t
-siphash24(const SIPHASH_KEY *key, const void *src, size_t len)
-{
-	SIPHASH_CTX ctx;
-
-	return (SipHashX(&ctx, 2, 4, (const uint8_t *)key, src, len));
-}
 
 /* Counter */
 void		wg_counter_init(struct wg_counter *);
@@ -114,18 +128,21 @@ int	wg_socket_send_buffer(struct wg_socket *, void *, size_t,
 void	wg_peer_expired_retransmit_handshake(struct wg_peer *);
 void	wg_peer_expired_send_keepalive(struct wg_peer *);
 void	wg_peer_expired_new_handshake(struct wg_peer *);
-void	wg_peer_expired_zero_key_material(struct wg_peer *);
-void	wg_peer_expired_send_persistent_keepalive(struct wg_peer *);
+static void wg_timers_peer_clear_secrets(struct wg_timers *t);
+static void	wg_peer_expired_send_persistent_keepalive(struct wg_timers *);
 void	wg_peer_timers_data_sent(struct wg_peer *);
 void	wg_peer_timers_data_received(struct wg_peer *);
 void	wg_peer_timers_any_authenticated_packet_sent(struct wg_peer *);
-void	wg_peer_timers_any_authenticated_packet_received(struct wg_peer *);
-void	wg_peer_timers_handshake_initiated(struct wg_peer *);
-void	wg_peer_timers_handshake_complete(struct wg_peer *);
-void	wg_peer_timers_session_derived(struct wg_peer *);
-void	wg_peer_timers_any_authenticated_packet_traversal(struct wg_peer *);
+static void	wg_timers_event_any_authenticated_packet_received(struct wg_timers *);
+static void	wg_peer_timers_handshake_initiated(struct wg_peer *);
+static void	wg_timers_event_handshake_responded(struct wg_timers *);
+static void	wg_timers_event_handshake_complete(struct wg_timers *);
+static void	wg_timers_event_session_derived(struct wg_timers *);
+static void	wg_timers_event_want_initiation(struct wg_timers *);
+
+static void	wg_timers_event_any_authenticated_packet_traversal(struct wg_timers *);
 void	wg_peer_timers_init(struct wg_peer *);
-void	wg_peer_timers_last_handshake(struct wg_peer *, struct timespec *);
+void	wg_timers_get_last_handshake(struct wg_timers *, struct timespec *);
 void	wg_peer_timers_stop(struct wg_peer *);
 int	wg_timers_expired(struct timespec *, time_t, long);
 
@@ -166,28 +183,6 @@ void	wg_hashtable_keypair_remove(struct wg_hashtable *,
 				    struct noise_keypair *);
 
 /* Noise */
-void	noise_remote_init(struct noise_remote *, const uint8_t [WG_KEY_SIZE]);
-void	noise_remote_set_psk(struct noise_remote *, uint8_t [WG_KEY_SIZE]);
-
-struct noise_keypair *
-	noise_keypair_create(void);
-void	noise_keypair_attach_to_peer(struct noise_keypair *, struct wg_peer *);
-struct noise_keypair *
-	noise_keypair_ref(struct noise_keypair *);
-void	noise_keypair_put(struct noise_keypair *);
-void	noise_keypair_destroy(struct noise_keypair **);
-void	noise_keypair_free(struct noise_keypair *);
-void	noise_keypairs_init(struct noise_keypairs *);
-void	noise_keypairs_clear(struct noise_keypairs *);
-void	noise_keypairs_insert_new(struct noise_keypairs *,
-				  struct noise_keypair *);
-struct noise_keypair *
-	noise_keypairs_lookup(struct noise_keypairs *,
-			      enum noise_keypair_type);
-int	noise_keypairs_begin_session(struct noise_keypairs *);
-int	noise_keypairs_received_with_keypair(struct noise_keypairs *,
-					     struct noise_keypair *);
-void	noise_keypairs_keep_key_fresh_recv(struct noise_keypairs *);
 
 void	noise_kdf(uint8_t *, uint8_t *, uint8_t *, const uint8_t *, size_t,
 		  size_t, size_t, size_t, const uint8_t [WG_HASH_SIZE]);
@@ -196,8 +191,6 @@ int	noise_mix_dh(uint8_t [WG_HASH_SIZE], uint8_t [WG_KEY_SIZE],
 void	noise_mix_hash(uint8_t [WG_HASH_SIZE], const uint8_t *, size_t);
 void	noise_mix_psk(uint8_t [WG_HASH_SIZE], uint8_t [WG_HASH_SIZE],
 		      uint8_t [WG_KEY_SIZE], const uint8_t [WG_KEY_SIZE]);
-void	noise_param_init(uint8_t [WG_HASH_SIZE], uint8_t [WG_HASH_SIZE],
-			 const uint8_t [WG_KEY_SIZE]);
 void	noise_message_encrypt(uint8_t *, const uint8_t *, size_t,
 			      uint8_t [WG_KEY_SIZE], uint8_t [WG_HASH_SIZE]);
 int	noise_message_decrypt(uint8_t *, const uint8_t *, size_t,
@@ -225,23 +218,10 @@ void	wg_ratelimiter_uninit(struct wg_ratelimiter *);
 int	wg_ratelimiter_allow(struct wg_ratelimiter *, struct mbuf *);
 
 /* Cookie */
-void	wg_precompute_key(uint8_t [WG_KEY_SIZE], const uint8_t [WG_KEY_SIZE],
-			  const char *);
-void	wg_cookie_checker_precompute_device_keys(struct wg_softc *);
-void	wg_cookie_init(struct wg_cookie *);
-void	wg_cookie_precompute_peer_keys(struct wg_peer *);
-void	wg_compute_mac1(uint8_t [WG_COOKIE_SIZE], const void *, size_t,
-			const uint8_t [WG_KEY_SIZE]);
-void	wg_compute_mac2(uint8_t [WG_COOKIE_SIZE], const void *, size_t,
-			const uint8_t [WG_COOKIE_SIZE]);
-void	wg_make_cookie(uint8_t [WG_COOKIE_SIZE], struct wg_endpoint *,
-		       struct wg_cookie_checker *);
-enum wg_cookie_mac_state
-	wg_cookie_validate_packet(struct wg_cookie_checker *, struct mbuf *,
+
+int
+	wg_cookie_validate_packet(struct cookie_checker *, struct mbuf *,
 				  int);
-void	wg_cookie_add_mac_to_packet(struct wg_cookie *, void *, size_t);
-void	wg_cookie_message_create(struct wg_pkt_cookie *, struct mbuf *,
-				 uint32_t, struct wg_cookie_checker *);
 void	wg_cookie_message_consume(struct wg_pkt_cookie *, struct wg_softc *);
 
 /* Peer */
@@ -249,10 +229,8 @@ void	wg_peer_destroy(struct wg_peer **);
 void	wg_peer_free(epoch_context_t ctx);
 
 void	wg_peer_queue_handshake_initiation(struct wg_peer *, int);
-void	wg_peer_send_handshake_initiation(struct wg_peer *);
-void	wg_peer_send_handshake_response(struct wg_peer *);
-void	wg_softc_send_handshake_cookie(struct wg_softc *, struct mbuf *,
-				       uint32_t);
+void	wg_send_initiation(struct wg_peer *);
+void	wg_send_cookie(struct wg_softc *, struct cookie_macs *, uint32_t, struct mbuf *);
 
 void	wg_peer_set_endpoint_from_mbuf(struct wg_peer *, struct mbuf *);
 void	wg_peer_clear_src(struct wg_peer *);
@@ -295,14 +273,16 @@ int	wg_clone_destroy(struct ifnet *);
 void	wgattach(int);
 
 
-struct m_dat_hdr {
-	uint8_t	mdh_types[2];
-};
+static struct noise_remote * wg_index_get(struct wg_softc *sc, uint32_t key0);
+
+static void wg_index_drop(struct wg_softc *sc, uint32_t key0);
+
 
 /* Globals */
 
-static volatile uint64_t keypair_counter = 0;
 static volatile unsigned long peer_counter = 0;
+static struct timeval	rekey_interval = { REKEY_TIMEOUT, 0 };
+
 
 static inline int
 callout_del(struct callout *c)
@@ -321,25 +301,7 @@ wg_m_freem_(struct mbuf *m, char *file, int line)
 /*
  * Magic values baked in to handshake protocol
  */
-static const uint8_t handshake_name[37] = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
-static const u8 identifier_name[34] = "WireGuard v1 zx2c4 Jason@zx2c4.com";
-
-static __read_mostly uint8_t handshake_init_hash[NOISE_HASH_LEN];
-static __read_mostly uint8_t handshake_init_chaining_key[NOISE_HASH_LEN];
 //static atomic64_t keypair_counter = ATOMIC64_INIT(0);
-
-void
-wg_noise_param_init(void)
-{
-	struct blake2s_state blake;
-
-	blake2s(handshake_init_chaining_key, handshake_name, NULL,
-		NOISE_HASH_LEN, sizeof(handshake_name), 0);
-	blake2s_init(&blake, NOISE_HASH_LEN);
-	blake2s_update(&blake, handshake_init_chaining_key, NOISE_HASH_LEN);
-	blake2s_update(&blake, identifier_name, sizeof(identifier_name));
-	blake2s_final(&blake, handshake_init_hash, NOISE_HASH_LEN);
-}
 
 /* Counter */
 void
@@ -586,17 +548,6 @@ wg_socket_port_set(struct wg_socket *so, in_port_t port)
 	mtx_unlock(&so->so_mtx);
 	return ret;
 }
-
-int
-wg_socket_rdomain_set(struct wg_socket *so, uint8_t rdomain)
-{
-	int ret;
-	mtx_lock(&so->so_mtx);
-	so->so_rdomain = rdomain;
-	ret = wg_socket_bind(so);
-	mtx_unlock(&so->so_mtx);
-	return ret;
-}
 #endif
 int
 wg_socket_send_mbuf(struct wg_socket *so, struct mbuf *m, uint16_t family)
@@ -671,10 +622,10 @@ void
 wg_peer_expired_retransmit_handshake(struct wg_peer *peer)
 {
 	rw_wlock(&peer->p_timers.t_lock);
-	if (peer->p_timers.t_handshake_attempts > MAX_TIMER_HANDSHAKES) {
+	if (peer->p_timers.t_handshake_retries > MAX_TIMER_HANDSHAKES) {
 		DPRINTF(peer->p_sc, "Handshake for peer %lu did not complete "
 				"after %d attempts, giving up\n", peer->p_id,
-				peer->p_timers.t_handshake_attempts);
+				peer->p_timers.t_handshake_retries);
 
 		if (callout_del(&peer->p_timers.t_send_keepalive))
 			wg_peer_put(peer);
@@ -684,14 +635,14 @@ wg_peer_expired_retransmit_handshake(struct wg_peer *peer)
 		if (!callout_pending(&peer->p_timers.t_zero_key_material))
 			if (callout_reset(&peer->p_timers.t_zero_key_material,
 							  REJECT_AFTER_TIME * 3 * hz,
-							  (timeout_t *)wg_peer_expired_zero_key_material, peer) == 0)
+							  (timeout_t *)wg_timers_peer_clear_secrets, &peer->p_timers) == 0)
 				wg_peer_ref(peer);
 	} else {
-		peer->p_timers.t_handshake_attempts++;
+		peer->p_timers.t_handshake_retries++;
 		DPRINTF(peer->p_sc, "Handshake for peer %lu did not complete "
 				"after %d seconds, retrying (try %d)\n",
 				peer->p_id, REKEY_TIMEOUT,
-				peer->p_timers.t_handshake_attempts);
+				peer->p_timers.t_handshake_retries);
 
 		/*
 		 * We clear the endpoint address src address, in case this is
@@ -739,25 +690,25 @@ wg_peer_expired_new_handshake(struct wg_peer *peer)
 	wg_peer_put(peer);
 }
 
-void
-wg_peer_expired_zero_key_material(struct wg_peer *peer)
+static void
+wg_timers_peer_clear_secrets(struct wg_timers *t)
 {
+
+	struct wg_peer *peer = CONTAINER_OF(t, struct wg_peer, p_timers);
 	DPRINTF(peer->p_sc, "Zeroing out all keys for peer %lu, since we "
 			"haven't received a new one in %d seconds\n",
 			peer->p_id, REJECT_AFTER_TIME * 3);
-
-	noise_keypairs_clear(&peer->p_keypairs);
-	wg_peer_put(peer);
+	panic("XXX replace");
+	// 	task_add(wg_handshake_taskq, &peer->p_clear_secrets);
+	/* wg_timers_peer_clear_secrets(struct wg_timers *t) */
 }
 
-void
-wg_peer_expired_send_persistent_keepalive(struct wg_peer *peer)
+static void
+wg_peer_expired_send_persistent_keepalive(struct wg_timers *t)
 {
-	rw_rlock(&peer->p_timers.t_lock);
-	if (peer->p_timers.t_persistent_keepalive_interval != 0)
-		wg_peer_send_keepalive(peer);
-	rw_runlock(&peer->p_timers.t_lock);
-	wg_peer_put(peer);
+
+	if (t->t_persistent_keepalive_interval != 0)
+		wg_peer_send_keepalive(CONTAINER_OF(t, struct wg_peer, p_timers));
 }
 
 /* Should be called after an authenticated data packet is sent. */
@@ -806,13 +757,11 @@ wg_peer_timers_any_authenticated_packet_sent(struct wg_peer *peer)
  * Should be called after any type of authenticated packet is received, whether
  * keepalive, data, or handshake.
  */
-void
-wg_peer_timers_any_authenticated_packet_received(struct wg_peer *peer)
+static void
+wg_peer_timers_any_authenticated_packet_received(struct wg_timers *t)
 {
-	rw_rlock(&peer->p_timers.t_lock);
-	if (callout_del(&peer->p_timers.t_new_handshake))
-		wg_peer_put(peer);
-	rw_runlock(&peer->p_timers.t_lock);
+
+	callout_del(&t->t_new_handshake);
 }
 
 /* Should be called after a handshake initiation message is sent. */
@@ -820,58 +769,97 @@ void
 wg_peer_timers_handshake_initiated(struct wg_peer *peer)
 {
 	rw_rlock(&peer->p_timers.t_lock);
-	if (callout_reset(&peer->p_timers.t_retransmit_handshake,
+	if (callout_reset(&peer->p_timers.t_retry_handshake,
 					  REKEY_TIMEOUT * hz + random() % REKEY_TIMEOUT_JITTER,
 					  (timeout_t *)wg_peer_expired_retransmit_handshake, peer) == 0)
 		wg_peer_ref(peer);
 	rw_runlock(&peer->p_timers.t_lock);
 }
 
+void
+wg_timers_event_handshake_responded(struct wg_timers *t)
+{
+	getmicrouptime(&t->t_handshake_touch);
+}
+
 /*
  * Should be called after a handshake response message is received and processed
  * or when getting key confirmation via the first data message.
  */
-void
-wg_peer_timers_handshake_complete(struct wg_peer *peer)
+static void
+wg_timers_event_handshake_complete(struct wg_timers *t)
 {
-	struct wg_timers *t = &peer->p_timers;
+	struct epoch_tracker et;
+	int ready = 0;
 
-	if (callout_del(&t->t_retransmit_handshake))
-		wg_peer_put(peer);
-	t->t_handshake_attempts = 0;
-	t->t_sent_lastminute_handshake = false;
-	getnanotime(&t->t_last_handshake);
+	NET_EPOCH_ENTER(et);
+	if (!t->t_disabled) {
+		mtx_lock(&t->t_handshake_mtx);
+		t->t_handshake_retries = 0;
+		callout_del(&t->t_retry_handshake);
+		getnanotime(&t->t_handshake_complete);
+		mtx_unlock(&t->t_handshake_mtx);
+		ready = 1;
+	}
+	if (ready)
+		wg_peer_send_keepalive(CONTAINER_OF(t, struct wg_peer, p_timers));
+	NET_EPOCH_EXIT(et);
 }
 
 /*
  * Should be called after an ephemeral key is created, which is before sending a
  * handshake response or after receiving a handshake response.
  */
-void
-wg_peer_timers_session_derived(struct wg_peer *peer)
+static void
+wg_timers_event_session_derived(struct wg_timers *t)
 {
-	rw_rlock(&peer->p_timers.t_lock);
-	if (callout_reset(&peer->p_timers.t_zero_key_material,
-					  REJECT_AFTER_TIME * 3 * hz,
-					  (timeout_t *)wg_peer_expired_zero_key_material, peer) == 0)
-		wg_peer_ref(peer);
-	rw_runlock(&peer->p_timers.t_lock);
+	struct epoch_tracker et;
+
+	NET_EPOCH_ENTER(et);
+	if (!t->t_disabled)
+		callout_reset(&t->t_zero_key_material,
+		    REJECT_AFTER_TIME * 3 * hz,
+		    (timeout_t *)wg_timers_peer_clear_secrets, t);
+	NET_EPOCH_EXIT(et);
+}
+
+static void
+wg_timers_event_want_initiation(struct wg_timers *t)
+{
+	int	ready = 0;
+	struct wg_peer *peer;
+	struct epoch_tracker et;
+
+	NET_EPOCH_ENTER(et);
+	mtx_lock(&t->t_handshake_mtx);
+	if (!t->t_disabled && ratecheck(&t->t_handshake_touch,
+	    &rekey_interval)) {
+		t->t_handshake_retries = 0;
+		ready = 1;
+		peer = CONTAINER_OF(t, struct wg_peer, p_timers);
+	}
+	mtx_unlock(&t->t_handshake_mtx);
+
+	if (ready) 
+		GROUPTASK_ENQUEUE(&peer->p_tx_initiation);
+	NET_EPOCH_EXIT(et);
 }
 
 /*
  * Should be called before a packet with authentication, whether
  * keepalive, data, or handshake is sent, or after one is received.
  */
-void
-wg_peer_timers_any_authenticated_packet_traversal(struct wg_peer *peer)
+static void
+wg_peer_timers_any_authenticated_packet_traversal(struct wg_timers *t)
 {
-	rw_rlock(&peer->p_timers.t_lock);
-	if (peer->p_timers.t_persistent_keepalive_interval)
-		if (callout_reset(&peer->p_timers.t_persistent_keepalive,
-						  peer->p_timers.t_persistent_keepalive_interval *hz,
-						  (timeout_t *)wg_peer_expired_send_persistent_keepalive, peer) == 0)
-			wg_peer_ref(peer);
-	rw_runlock(&peer->p_timers.t_lock);
+	struct epoch_tracker et;
+
+	NET_EPOCH_ENTER(et);
+	if (!t->t_disabled && t->t_persistent_keepalive_interval > 0)
+		callout_reset(&t->t_persistent_keepalive,
+		     t->t_persistent_keepalive_interval *hz,
+		    (timeout_t *)wg_peer_expired_send_persistent_keepalive, t);
+	NET_EPOCH_EXIT(et);
 }
 
 void
@@ -882,7 +870,7 @@ wg_peer_timers_init(struct wg_peer *peer)
 	bzero(t, sizeof(*t));
 
 	rw_init(&peer->p_timers.t_lock, "wg_peer_timers");
-	callout_init(&t->t_retransmit_handshake, true);
+	callout_init(&t->t_retry_handshake, true);
 	callout_init(&t->t_send_keepalive, true);
 	callout_init(&t->t_new_handshake, true);
 	callout_init(&t->t_zero_key_material, true);
@@ -890,18 +878,18 @@ wg_peer_timers_init(struct wg_peer *peer)
 }
 
 void
-wg_peer_timers_last_handshake(struct wg_peer *peer, struct timespec *time)
+wg_timers_get_last_handshake(struct wg_timers *t, struct timespec *time)
+
 {
-	rw_rlock(&peer->p_timers.t_lock);
-	*time = peer->p_timers.t_last_handshake;
-	rw_runlock(&peer->p_timers.t_lock);
+	time->tv_sec = t->t_handshake_complete.tv_sec;
+	time->tv_nsec = t->t_handshake_complete.tv_nsec;
 }
 
 void
 wg_peer_timers_stop(struct wg_peer *peer)
 {
 	rw_wlock(&peer->p_timers.t_lock);
-	if (callout_del(&peer->p_timers.t_retransmit_handshake))
+	if (callout_del(&peer->p_timers.t_retry_handshake))
 		wg_peer_put(peer);
 	if (callout_del(&peer->p_timers.t_send_keepalive))
 		wg_peer_put(peer);
@@ -1266,789 +1254,6 @@ wg_hashtable_peer_remove(struct wg_hashtable *ht, struct wg_peer *peer)
 	mtx_unlock(&ht->h_mtx);
 }
 
-uint32_t
-wg_hashtable_keypair_insert(struct wg_hashtable *ht,
-			    struct noise_keypair *keypair)
-{
-	uint32_t index;
-	struct noise_keypair *i;
-
-	mtx_lock(&ht->h_mtx);
-	ht->h_num_keys++;
-assign_id:
-	index = arc4random();
-	LIST_FOREACH(i, &ht->h_keys[index & ht->h_keys_mask], k_entry)
-		if (i->k_local_index == index)
-			goto assign_id;
-
-	keypair->k_local_index = index;
-	keypair = noise_keypair_ref(keypair);
-	LIST_INSERT_HEAD(&ht->h_keys[index & ht->h_keys_mask], keypair, k_entry);
-
-	mtx_unlock(&ht->h_mtx);
-	return index;
-}
-
-struct noise_keypair *
-wg_hashtable_keypair_lookup(struct wg_hashtable *ht, const uint32_t index)
-{
-	struct noise_keypair *i, *keypair = NULL;
-
-	mtx_lock(&ht->h_mtx);
-	LIST_FOREACH(i, &ht->h_keys[index & ht->h_keys_mask], k_entry) {
-		if (i->k_local_index == index) {
-			keypair = noise_keypair_ref(i);
-			break;
-		}
-	}
-	mtx_unlock(&ht->h_mtx);
-
-	return keypair;
-}
-
-void
-wg_hashtable_keypair_remove(struct wg_hashtable *ht,
-			    struct noise_keypair *keypair)
-{
-	mtx_lock(&ht->h_mtx);
-	ht->h_num_keys--;
-	LIST_REMOVE(keypair, k_entry);
-	noise_keypair_put(keypair);
-	mtx_unlock(&ht->h_mtx);
-}
-
-/* Noise */
-void
-noise_remote_init(struct noise_remote *remote, const uint8_t pubkey[WG_KEY_SIZE])
-{
-	bzero(remote, sizeof(*remote));
-	mtx_init(&remote->r_mtx, "noise remote", NULL, MTX_DEF);
-	memcpy(remote->r_public, pubkey, WG_KEY_SIZE);
-}
-
-void
-noise_remote_set_psk(struct noise_remote *remote, uint8_t key[WG_KEY_SIZE])
-{
-	mtx_lock(&remote->r_mtx);
-	memcpy(remote->r_psk, key, WG_KEY_SIZE);
-	mtx_unlock(&remote->r_mtx);
-}
-
-void
-noise_local_init(struct noise_local *local)
-{
-	rw_init(&local->l_lock, "noise_local");
-}
-
-void
-noise_local_set_private(struct noise_local *local,
-		const uint8_t key[WG_KEY_SIZE])
-{
-	rw_wlock(&local->l_lock);
-	memcpy(local->l_private, key, WG_KEY_SIZE);
-	curve25519_clamp_secret(local->l_private);
-	local->l_has_identity = curve25519_generate_public(local->l_public,
-			local->l_private);
-	rw_wunlock(&local->l_lock);
-}
-
-struct noise_keypair *
-noise_keypair_create(void)
-{
-	struct noise_keypair *keypair;
-
-	keypair = malloc(sizeof(*keypair), M_WG, M_NOWAIT|M_ZERO);
-	if (__predict_false(keypair == NULL))
-		return (NULL);
-
-	refcount_init(&keypair->k_refcnt, 0);
-	keypair->k_id = keypair_counter++;
-	keypair->k_peer = NULL;
-
-	wg_counter_init(&keypair->k_counter);
-	getnanotime(&keypair->k_birthdate);
-	mtx_init(&keypair->k_mtx, "keypair lock", NULL, MTX_DEF);
-	keypair->k_state = HANDSHAKE_ZEROED;
-
-	return keypair;
-}
-
-void
-noise_keypair_attach_to_peer(struct noise_keypair *keypair,
-			     struct wg_peer *peer)
-{
-	mtx_lock(&keypair->k_mtx);
-
-	MPASS(keypair->k_peer == NULL);
-	keypair->k_peer = peer;
-	noise_keypairs_insert_new(&peer->p_keypairs, keypair);
-	wg_hashtable_keypair_insert(&peer->p_sc->sc_hashtable, keypair);
-	mtx_unlock(&keypair->k_mtx);
-
-	DPRINTF(keypair->k_peer->p_sc, "Keypair %lu created for peer %lu\n",
-		keypair->k_id, keypair->k_peer->p_id);
-}
-
-struct noise_keypair *
-noise_keypair_ref(struct noise_keypair *keypair)
-{
-	if (keypair != NULL)
-		refcount_acquire(&keypair->k_refcnt);
-
-	return keypair;
-}
-
-void
-noise_keypair_put(struct noise_keypair *keypair)
-{
-	if (keypair != NULL)
-		if (refcount_release(&keypair->k_refcnt))
-			noise_keypair_free(keypair);
-}
-
-void
-noise_keypair_destroy(struct noise_keypair **keypair_p)
-{
-	struct noise_keypair *keypair = *keypair_p;
-
-	if (keypair == NULL)
-		return;
-
-	*keypair_p = NULL;
-	wg_hashtable_keypair_remove(&keypair->k_peer->p_sc->sc_hashtable,
-	    keypair);
-
-	//NET_EPOCH_CALL(...)   XXX
-	//noise_keypair_put(keypair);
-}
-
-void
-noise_keypair_free(struct noise_keypair *keypair)
-{
-	DPRINTF(keypair->k_peer->p_sc, "Keypair %lu destroyed\n",
-		keypair->k_id);
-	zfree(keypair, M_WG);
-}
-
-void
-noise_keypairs_init(struct noise_keypairs *keypairs)
-{
-	bzero(keypairs, sizeof(*keypairs));
-	mtx_init(&keypairs->kp_mtx, "keypairs lock", NULL, MTX_DEF);
-}
-
-void
-noise_keypairs_clear(struct noise_keypairs *keypairs)
-{
-	mtx_lock(&keypairs->kp_mtx);
-	noise_keypair_destroy(&keypairs->kp_next_keypair);
-	noise_keypair_destroy(&keypairs->kp_previous_keypair);
-	noise_keypair_destroy(&keypairs->kp_current_keypair);
-	mtx_unlock(&keypairs->kp_mtx);
-}
-
-void
-noise_keypairs_insert_new(struct noise_keypairs *keypairs,
-			  struct noise_keypair *keypair)
-{
-	mtx_lock(&keypairs->kp_mtx);
-	noise_keypair_destroy(&keypairs->kp_next_keypair);
-	keypairs->kp_next_keypair = keypair;
-	mtx_unlock(&keypairs->kp_mtx);
-}
-
-struct noise_keypair *
-noise_keypairs_lookup(struct noise_keypairs *keypairs,
-		      enum noise_keypair_type type)
-{
-	struct noise_keypair *keypair = NULL;
-	NET_EPOCH_ASSERT();
-
-	if (type == NOISE_KEYPAIR_CURRENT)
-		keypair = noise_keypair_ref(keypairs->kp_current_keypair);
-	else if (type == NOISE_KEYPAIR_PREVIOUS)
-		keypair = noise_keypair_ref(keypairs->kp_previous_keypair);
-	else if (type == NOISE_KEYPAIR_NEXT)
-		keypair = noise_keypair_ref(keypairs->kp_next_keypair);
-	return (keypair);
-}
-
-int
-noise_keypairs_begin_session(struct noise_keypairs *keypairs)
-{
-	struct noise_keypair *keypair;
-
-	mtx_lock(&keypairs->kp_mtx);
-	if (keypairs->kp_next_keypair == NULL) {
-		mtx_unlock(&keypairs->kp_mtx);
-		return ENOENT;
-	}
-
-	keypair = keypairs->kp_next_keypair;
-
-	if (keypair->k_state == HANDSHAKE_CONSUMED_RESPONSE) {
-		/*
-		 * If we're the initiator, it means we've sent a handshake, and
-		 * received a confirmation response, which means this new
-		 * keypair can now be used.
-		 */
-		noise_kdf(keypair->k_send, keypair->k_recv, NULL, NULL,
-		    WG_KEY_SIZE, WG_KEY_SIZE, 0, 0, keypair->k_chaining_key);
-
-		noise_keypair_destroy(&keypairs->kp_previous_keypair);
-		keypairs->kp_previous_keypair = keypairs->kp_current_keypair;
-		keypairs->kp_current_keypair = keypairs->kp_next_keypair;
-		keypairs->kp_next_keypair = NULL;
-
-		keypair->k_state = KEYPAIR_INITIATOR;
-
-	} else if (keypair->k_state == HANDSHAKE_CREATED_RESPONSE) {
-		/*
-		 * If we're the responder, it means we can't use the new
-		 * keypair until we receive confirmation via the first data
-		 * packet, so we leave it in the next slot. It is expected to
-		 * get promoted in noise_keypairs_received_with_keypair.
-		 */
-		noise_kdf(keypair->k_recv, keypair->k_send, NULL, NULL,
-				WG_KEY_SIZE, WG_KEY_SIZE, 0, 0,
-				keypair->k_chaining_key);
-	} else {
-		mtx_unlock(&keypairs->kp_mtx);
-		return ENOTRECOVERABLE;
-	}
-
-	mtx_unlock(&keypairs->kp_mtx);
-
-	explicit_bzero(keypair->k_ephemeral_private, WG_KEY_SIZE);
-	explicit_bzero(keypair->k_remote_ephemeral, WG_KEY_SIZE);
-	explicit_bzero(keypair->k_hash, WG_HASH_SIZE);
-	explicit_bzero(keypair->k_chaining_key, WG_HASH_SIZE);
-
-	return 0;
-}
-
-int
-noise_keypairs_received_with_keypair(struct noise_keypairs *keypairs,
-				     struct noise_keypair *received_keypair)
-{
-	/* We first check without taking the mutex, then check again after */
-	if (received_keypair != keypairs->kp_next_keypair)
-		return EISCONN;
-
-	mtx_lock(&keypairs->kp_mtx);
-	if (received_keypair != keypairs->kp_next_keypair) {
-		mtx_unlock(&keypairs->kp_mtx);
-		return EISCONN;
-	}
-
-	/*
-	 * When we've finally received the confirmation, we slide the next
-	 * into the current, the current into the previous, and get rid of
-	 * the old previous.
-	 */
-	noise_keypair_destroy(&keypairs->kp_previous_keypair);
-	keypairs->kp_previous_keypair = keypairs->kp_current_keypair;
-	keypairs->kp_current_keypair = keypairs->kp_next_keypair;
-	keypairs->kp_next_keypair = NULL;
-
-	received_keypair->k_state = KEYPAIR_RESPONDER;
-
-	mtx_unlock(&keypairs->kp_mtx);
-
-	return 0;
-}
-
-static void
-noise_keypairs_keep_key_fresh_send(struct wg_peer *peer)
-{
-	struct wg_timers *t;
-	struct noise_keypair *keypair;
-	struct epoch_tracker et;
-	bool send = false;
-
-	t = &peer->p_timers;
-	NET_EPOCH_ENTER(et);
-	keypair = peer->p_keypairs.kp_current_keypair;
-
-	if (keypair != NULL &&
-	    (keypair->k_counter.c_send > REKEY_AFTER_MESSAGES ||
-	     (keypair->k_state == KEYPAIR_INITIATOR &&
-	      wg_timers_expired(&keypair->k_birthdate, REKEY_AFTER_TIME, 0))))
-		send = true;
-	NET_EPOCH_EXIT(et);
-
-	if (send)
-		wg_peer_queue_handshake_initiation(peer, false);
-}
-
-void
-noise_keypairs_keep_key_fresh_recv(struct noise_keypairs *keypairs)
-{
-	struct noise_keypair *keypair;
-
-	mtx_lock(&keypairs->kp_mtx);
-	keypair = keypairs->kp_current_keypair;
-
-	if (keypair != NULL &&
-	    keypair->k_state == KEYPAIR_INITIATOR &&
-	     wg_timers_expired(&keypair->k_birthdate,
-	      REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT, 0))
-		wg_peer_queue_handshake_initiation(keypair->k_peer, 0);
-	mtx_unlock(&keypairs->kp_mtx);
-}
-
-/* This is Hugo Krawczyk's HKDF:
- *  - https://eprint.iacr.org/2010/264.pdf
- *  - https://tools.ietf.org/html/rfc5869
- */
-void
-noise_kdf(uint8_t *a, uint8_t *b, uint8_t *c, const uint8_t *x,
-	  size_t a_len, size_t b_len, size_t c_len, size_t x_len,
-	  const uint8_t ck[WG_HASH_SIZE])
-{
-	uint8_t out[BLAKE2S_HASH_SIZE + 1];
-	uint8_t sec[BLAKE2S_HASH_SIZE];
-
-#ifdef DIAGNOSTIC
-	MPASS(a_len <= BLAKE2S_HASH_SIZE && b_len <= BLAKE2S_HASH_SIZE &&
-			c_len <= BLAKE2S_HASH_SIZE);
-	MPASS(!(b || b_len || c || c_len) || (a && a_len));
-	MPASS(!(c || c_len) || (b && b_len));
-#endif
-
-	/* Extract entropy from "x" into sec */
-	blake2s_hmac(sec, x, ck, BLAKE2S_HASH_SIZE, x_len, WG_HASH_SIZE);
-
-	if (a == NULL || a_len == 0)
-		goto out;
-
-	/* Expand first key: key = sec, data = 0x1 */
-	out[0] = 1;
-	blake2s_hmac(out, out, sec, BLAKE2S_HASH_SIZE, 1, BLAKE2S_HASH_SIZE);
-	memcpy(a, out, a_len);
-
-	if (b == NULL || b_len == 0)
-		goto out;
-
-	/* Expand second key: key = sec, data = "a" || 0x2 */
-	out[BLAKE2S_HASH_SIZE] = 2;
-	blake2s_hmac(out, out, sec, BLAKE2S_HASH_SIZE, BLAKE2S_HASH_SIZE + 1,
-			BLAKE2S_HASH_SIZE);
-	memcpy(b, out, b_len);
-
-	if (c == NULL || c_len == 0)
-		goto out;
-
-	/* Expand third key: key = sec, data = "b" || 0x3 */
-	out[BLAKE2S_HASH_SIZE] = 3;
-	blake2s_hmac(out, out, sec, BLAKE2S_HASH_SIZE, BLAKE2S_HASH_SIZE + 1,
-			BLAKE2S_HASH_SIZE);
-	memcpy(c, out, c_len);
-
-out:
-	/* Clear sensitive data from stack */
-	explicit_bzero(sec, BLAKE2S_HASH_SIZE);
-	explicit_bzero(out, BLAKE2S_HASH_SIZE + 1);
-}
-
-int
-noise_mix_dh(uint8_t ck[WG_HASH_SIZE], uint8_t key[WG_KEY_SIZE],
-	const uint8_t private[WG_KEY_SIZE], const uint8_t public[WG_KEY_SIZE])
-{
-	uint8_t dh[WG_KEY_SIZE];
-
-	if (!curve25519(dh, private, public))
-		return EINVAL;
-	noise_kdf(ck, key, NULL, dh,
-		  WG_HASH_SIZE, WG_KEY_SIZE, 0, WG_KEY_SIZE, ck);
-	explicit_bzero(dh, WG_KEY_SIZE);
-	return 0;
-}
-
-void
-noise_mix_hash(uint8_t hash[WG_HASH_SIZE], const uint8_t *src, size_t src_len)
-{
-	struct blake2s_state blake;
-
-	blake2s_init(&blake, WG_HASH_SIZE);
-	blake2s_update(&blake, hash, WG_HASH_SIZE);
-	blake2s_update(&blake, src, src_len);
-	blake2s_final(&blake, hash, WG_HASH_SIZE);
-}
-
-void
-noise_mix_psk(uint8_t ck[WG_HASH_SIZE], uint8_t hash[WG_HASH_SIZE],
-	      uint8_t key[WG_KEY_SIZE], const uint8_t psk[WG_KEY_SIZE])
-{
-	uint8_t tmp[WG_HASH_SIZE];
-
-	noise_kdf(ck, tmp, key, psk,
-		  WG_HASH_SIZE, WG_HASH_SIZE, WG_KEY_SIZE, WG_KEY_SIZE, ck);
-	noise_mix_hash(hash, tmp, WG_HASH_SIZE);
-	explicit_bzero(tmp, WG_HASH_SIZE);
-}
-
-static void
-handshake_init(uint8_t chaining_key[WG_HASH_SIZE],
-			   u8 hash[NOISE_HASH_LEN],
-			   const u8 remote_static[NOISE_PUBLIC_KEY_LEN])
-{
-	memcpy(hash, handshake_init_hash, WG_HASH_SIZE);
-	memcpy(chaining_key, handshake_init_chaining_key, WG_HASH_SIZE);
-	noise_mix_hash(hash, remote_static,  WG_KEY_SIZE);
-}
-
-void
-noise_message_encrypt(uint8_t *dst, const uint8_t *src, size_t src_len,
-		uint8_t key[WG_KEY_SIZE], uint8_t hash[WG_HASH_SIZE])
-{
-	/* Nonce always zero for Noise_IK */
-	chacha20poly1305_encrypt(dst, src, src_len, hash, WG_HASH_SIZE, 0, key);
-	noise_mix_hash(hash, dst, src_len + WG_MAC_SIZE);
-}
-
-int
-noise_message_decrypt(uint8_t *dst, const uint8_t *src, size_t src_len,
-		uint8_t key[WG_KEY_SIZE], uint8_t hash[WG_HASH_SIZE])
-{
-	/* Nonce always zero for Noise_IK */
-	if (!chacha20poly1305_decrypt(dst, src, src_len,
-				      hash, WG_HASH_SIZE, 0, key))
-		return EINVAL;
-	noise_mix_hash(hash, src, src_len);
-	return 0;
-}
-
-void
-noise_message_ephemeral(uint8_t dst[WG_KEY_SIZE],
-			const uint8_t src[WG_KEY_SIZE],
-			uint8_t ck[WG_HASH_SIZE], uint8_t hash[WG_HASH_SIZE])
-{
-	if (dst != src)
-		memcpy(dst, src, WG_KEY_SIZE);
-	noise_mix_hash(hash, src, WG_KEY_SIZE);
-	noise_kdf(ck, NULL, NULL, src, WG_HASH_SIZE, 0, 0, WG_KEY_SIZE, ck);
-}
-
-void
-noise_tai64n_now(uint8_t output[WG_TIMESTAMP_SIZE])
-{
-	struct timespec now;
-
-	getnanotime(&now);
-
-	/*
-	 * Set nsec = 0 to prevent any sort of infoleak from precise timers. As
-	 * we are restricted to sending one initiation every 5 seconds, having
-	 * single second accuracy is sufficient.
-	 */
-	now.tv_nsec = 0;
-
-	/* https://cr.yp.to/libtai/tai64.html */
-	*(uint64_t *)output = htobe64(0x400000000000000aULL + now.tv_sec);
-	*(uint32_t *)(output + sizeof(uint64_t)) = htobe32(now.tv_nsec);
-}
-
-int
-noise_handshake_create_initiation(struct wg_pkt_initiation *dst,
-				     struct wg_peer *peer)
-{
-	uint8_t timestamp[WG_TIMESTAMP_SIZE];
-	uint8_t key[WG_KEY_SIZE], ss[WG_KEY_SIZE];
-	struct noise_local *local = &peer->p_sc->sc_local;
-	struct noise_keypair *keypair;
-
-	NET_EPOCH_ASSERT();
-
-	if ((keypair = noise_keypair_create()) == NULL)
-		goto out;
-
-	if (!local->l_has_identity) {
-		printf("%s doesn't have identity\n", __func__);
-		goto out;
-	}
-	handshake_init(keypair->k_chaining_key, keypair->k_hash,
-			peer->p_remote.r_public);
-
-	/* e */
-	curve25519_generate_secret(keypair->k_ephemeral_private);
-	if (!curve25519_generate_public(dst->unencrypted_ephemeral,
-					keypair->k_ephemeral_private))
-		goto out;
-	noise_message_ephemeral(dst->unencrypted_ephemeral,
-				dst->unencrypted_ephemeral,
-				keypair->k_chaining_key, keypair->k_hash);
-
-	/* es */
-	if (noise_mix_dh(keypair->k_chaining_key, key,
-	    keypair->k_ephemeral_private, peer->p_remote.r_public) != 0)
-		goto out;
-
-	/* s */
-	noise_message_encrypt(dst->encrypted_static,
-			peer->p_sc->sc_local.l_public,
-			WG_KEY_SIZE, key, keypair->k_hash);
-
-	/* ss */
-	if (!curve25519(ss, local->l_private, peer->p_remote.r_public))
-		goto out;
-	noise_kdf(keypair->k_chaining_key, key, NULL, ss, WG_HASH_SIZE,
-		  WG_KEY_SIZE, 0, WG_KEY_SIZE, keypair->k_chaining_key);
-
-	/* {t} */
-	noise_tai64n_now(timestamp);
-	noise_message_encrypt(dst->encrypted_timestamp, timestamp,
-			WG_TIMESTAMP_SIZE, key, keypair->k_hash);
-
-	keypair->k_state = HANDSHAKE_CREATED_INITIATION;
-
-	noise_keypair_attach_to_peer(keypair, peer);
-
-	dst->header.type = htole32(MESSAGE_HANDSHAKE_INITIATION);
-	dst->sender_index = keypair->k_local_index;
-out:
-	explicit_bzero(ss, WG_KEY_SIZE);
-	explicit_bzero(key, WG_KEY_SIZE);
-	return keypair->k_state == HANDSHAKE_CREATED_INITIATION ? 0 : EINVAL;
-}
-
-struct noise_keypair *
-noise_handshake_consume_initiation(struct wg_pkt_initiation *src,
-				      struct wg_softc *sc)
-{
-	struct noise_keypair *keypair = NULL;
-	struct wg_peer *peer = NULL;
-	uint8_t key[WG_KEY_SIZE], ss[WG_KEY_SIZE];
-	uint8_t chaining_key[WG_HASH_SIZE];
-	uint8_t hash[WG_HASH_SIZE];
-	uint8_t s[WG_KEY_SIZE];
-	uint8_t e[WG_KEY_SIZE];
-	uint8_t t[WG_TIMESTAMP_SIZE];
-
-	rw_rlock(&sc->sc_local.l_lock);
-	if (!sc->sc_local.l_has_identity)
-		goto out;
-
-	handshake_init(chaining_key, hash, sc->sc_local.l_public);
-
-	/* e */
-	noise_message_ephemeral(e, src->unencrypted_ephemeral, chaining_key,
-				hash);
-
-	/* es */
-	if (noise_mix_dh(chaining_key, key, sc->sc_local.l_private, e) != 0) {
-		printf("mix fail\n");
-		goto out;
-	}
-	/* s */
-	if (noise_message_decrypt(s, src->encrypted_static,
-			     sizeof(src->encrypted_static), key, hash) != 0) 
-	{
-		printf("decrypt fail\n");
-		goto out;
-	}
-	/* Lookup which peer we're actually talking to */
-	peer = wg_hashtable_peer_lookup(&sc->sc_hashtable, s);
-	if (peer == NULL) {
-		printf("peer lookup fail\n");
-
-		goto out;
-
-	}		
-	/* ss */
-	if (!curve25519(ss, sc->sc_local.l_private,
-				peer->p_remote.r_public))
-	{
-		printf("curve fail\n");
-		goto out;
-	}
-	noise_kdf(chaining_key, key, NULL, ss, WG_HASH_SIZE, WG_KEY_SIZE, 0,
-			WG_KEY_SIZE, chaining_key);
-
-	/* {t} */
-	if (noise_message_decrypt(t, src->encrypted_timestamp,
-				  sizeof(src->encrypted_timestamp),
-				  key, hash) != 0)
-		goto out;
-
-	/* If we're all good, go ahead and create a new keypair. */
-	mtx_lock(&peer->p_remote.r_mtx);
-
-	if (memcmp(t, peer->p_remote.r_ts, WG_TIMESTAMP_SIZE) > 0)
-		memcpy(peer->p_remote.r_ts, t, WG_TIMESTAMP_SIZE);
-	else {
-		printf("timestamp fail\n");
-		goto out_mtx; /* Replay attack */
-	}
-	if (wg_timers_expired(&peer->p_remote.r_last_init, 0,
-			1000*1000*1000 / INITIATIONS_PER_SECOND))
-		getnanotime(&peer->p_remote.r_last_init); 
-	else {
-		printf("flood fail\n");
-				
-		goto out_mtx; /* Flood attack */
-	}
-	if ((keypair = noise_keypair_create()) == NULL) {
-		printf("kp create fail\n");
-		goto out_mtx;
-	}
-	memcpy(keypair->k_remote_ephemeral, e, WG_KEY_SIZE);
-	memcpy(keypair->k_hash, hash, WG_HASH_SIZE);
-	memcpy(keypair->k_chaining_key, chaining_key, WG_HASH_SIZE);
-
-	keypair->k_remote_index = src->sender_index;
-	keypair->k_state = HANDSHAKE_CONSUMED_INITIATION;
-
-	noise_keypair_attach_to_peer(keypair, peer);
-
-	/* Cleanup */
-out_mtx:
-	mtx_unlock(&peer->p_remote.r_mtx);
-out:
-	rw_runlock(&sc->sc_local.l_lock);
-	wg_peer_put(peer);
-
-	explicit_bzero(ss, WG_KEY_SIZE);
-	explicit_bzero(key, WG_KEY_SIZE);
-	explicit_bzero(hash, WG_HASH_SIZE);
-	explicit_bzero(chaining_key, WG_HASH_SIZE);
-
-	return keypair;
-}
-
-int
-noise_handshake_create_response(struct wg_pkt_response *dst,
-					struct wg_peer *peer)
-{
-	struct noise_keypair *keypair;
-	uint8_t key[WG_KEY_SIZE];
-
-	keypair = noise_keypairs_lookup(&peer->p_keypairs, NOISE_KEYPAIR_NEXT);
-	if (keypair == NULL)
-		return 0;
-
-	rw_rlock(&peer->p_sc->sc_local.l_lock);
-
-	mtx_lock(&keypair->k_mtx);
-	if (keypair->k_state != HANDSHAKE_CONSUMED_INITIATION)
-		goto out;
-
-	dst->header.type = htole32(MESSAGE_HANDSHAKE_RESPONSE);
-	dst->receiver_index = keypair->k_remote_index;
-	dst->sender_index = keypair->k_local_index;
-
-	/* e */
-	curve25519_generate_secret(keypair->k_ephemeral_private);
-	if (!curve25519_generate_public(dst->unencrypted_ephemeral,
-					keypair->k_ephemeral_private))
-		goto out;
-	noise_message_ephemeral(dst->unencrypted_ephemeral,
-			  dst->unencrypted_ephemeral, keypair->k_chaining_key,
-			  keypair->k_hash);
-
-	/* ee */
-	if (noise_mix_dh(keypair->k_chaining_key, NULL,
-			 keypair->k_ephemeral_private,
-			 keypair->k_remote_ephemeral) != 0)
-		goto out;
-
-	/* se */
-	if (noise_mix_dh(keypair->k_chaining_key, NULL,
-			 keypair->k_ephemeral_private,
-			 peer->p_remote.r_public) != 0)
-		goto out;
-
-	/* psk */
-	noise_mix_psk(keypair->k_chaining_key, keypair->k_hash, key,
-		      peer->p_remote.r_psk);
-
-	/* {} */
-	noise_message_encrypt(dst->encrypted_nothing, NULL, 0, key,
-			      keypair->k_hash);
-
-	keypair->k_state = HANDSHAKE_CREATED_RESPONSE;
-out:
-	mtx_unlock(&keypair->k_mtx);
-	rw_runlock(&peer->p_sc->sc_local.l_lock);
-	explicit_bzero(key, WG_KEY_SIZE);
-	return keypair != NULL &&
-	       keypair->k_state == HANDSHAKE_CREATED_RESPONSE ? 0 : EINVAL;
-}
-
-struct noise_keypair *
-noise_handshake_consume_response(struct wg_pkt_response *src,
-				    struct wg_softc *sc)
-{
-	enum noise_keypair_state state = HANDSHAKE_ZEROED;
-	struct noise_keypair *keypair;
-	uint8_t key[WG_KEY_SIZE];
-	uint8_t hash[WG_HASH_SIZE];
-	uint8_t chaining_key[WG_HASH_SIZE];
-	uint8_t e[WG_KEY_SIZE];
-	uint8_t ephemeral_private[WG_KEY_SIZE];
-	uint8_t static_private[WG_KEY_SIZE];
-
-	keypair = wg_hashtable_keypair_lookup(&sc->sc_hashtable,
-					      src->receiver_index);
-	if (keypair == NULL)
-		return NULL;
-
-	rw_rlock(&sc->sc_local.l_lock);
-
-	if (!sc->sc_local.l_has_identity)
-		goto out;
-
-	mtx_lock(&keypair->k_mtx);
-	state = keypair->k_state;
-	memcpy(hash, keypair->k_hash, WG_HASH_SIZE);
-	memcpy(chaining_key, keypair->k_chaining_key, WG_HASH_SIZE);
-	memcpy(ephemeral_private, keypair->k_ephemeral_private,
-	       WG_KEY_SIZE);
-	mtx_unlock(&keypair->k_mtx);
-
-	if (state != HANDSHAKE_CREATED_INITIATION)
-		goto out;
-
-	/* e */
-	noise_message_ephemeral(e, src->unencrypted_ephemeral, chaining_key,
-				hash);
-
-	/* ee */
-	if (noise_mix_dh(chaining_key, NULL, ephemeral_private, e) != 0)
-		goto out;
-
-	/* se */
-	if (noise_mix_dh(chaining_key, NULL, sc->sc_local.l_private, e) != 0)
-		goto out;
-
-	/* psk */
-	noise_mix_psk(chaining_key, hash, key, keypair->k_peer->p_remote.r_psk);
-
-	/* {} */
-	if (noise_message_decrypt(NULL, src->encrypted_nothing,
-			     sizeof(src->encrypted_nothing), key, hash) != 0)
-		goto out;
-
-	/* Success! Copy everything to peer */
-	mtx_lock(&keypair->k_mtx);
-	if (keypair->k_state == state) {
-		memcpy(keypair->k_remote_ephemeral, e, WG_KEY_SIZE);
-		memcpy(keypair->k_hash, hash, WG_HASH_SIZE);
-		memcpy(keypair->k_chaining_key, chaining_key, WG_HASH_SIZE);
-		keypair->k_remote_index = src->sender_index;
-		keypair->k_state = HANDSHAKE_CONSUMED_RESPONSE;
-	}
-	mtx_unlock(&keypair->k_mtx);
-out:
-	explicit_bzero(key, WG_KEY_SIZE);
-	explicit_bzero(hash, WG_HASH_SIZE);
-	explicit_bzero(chaining_key, WG_HASH_SIZE);
-	explicit_bzero(ephemeral_private, WG_KEY_SIZE);
-	explicit_bzero(static_private, WG_KEY_SIZE);
-	rw_runlock(&sc->sc_local.l_lock);
-	return keypair->k_state == HANDSHAKE_CONSUMED_RESPONSE ? keypair : NULL;
-}
-
 /*
  * Ratelimiter
  *
@@ -2075,230 +1280,49 @@ wg_ratelimiter_allow(struct wg_ratelimiter *ratelimiter, struct mbuf *m)
 }
 
 /* Cookie */
-void
-wg_precompute_key(uint8_t key[WG_KEY_SIZE],
-    const uint8_t pubkey[WG_KEY_SIZE],
-    const char *label)
-{
-	struct blake2s_state blake;
-
-	blake2s_init(&blake, WG_KEY_SIZE);
-	blake2s_update(&blake, label, strlen(label));
-	blake2s_update(&blake, pubkey, WG_KEY_SIZE);
-	blake2s_final(&blake, key, WG_KEY_SIZE);
-}
-
-void
-wg_cookie_checker_init(struct wg_cookie_checker *checker)
-{
-	mtx_init(&checker->cc_mtx, "cookie checker", NULL, MTX_DEF);
-	getnanotime(&checker->cc_secret_birthdate);
-	arc4random_buf(checker->cc_secret, WG_HASH_SIZE);
-}
-
-void
-wg_cookie_checker_precompute_device_keys(struct wg_softc *sc)
-{
-	mtx_lock(&sc->sc_cookie_checker.cc_mtx);
-	if (sc->sc_local.l_has_identity) {
-		wg_precompute_key(sc->sc_cookie_checker.cc_cookie_key,
-				  sc->sc_local.l_public, COOKIE_KEY_LABEL);
-		wg_precompute_key(sc->sc_cookie_checker.cc_message_mac1_key,
-				  sc->sc_local.l_public, MAC1_KEY_LABEL);
-	} else {
-		bzero(sc->sc_cookie_checker.cc_cookie_key, WG_KEY_SIZE);
-		bzero(sc->sc_cookie_checker.cc_message_mac1_key, WG_KEY_SIZE);
-	}
-	mtx_unlock(&sc->sc_cookie_checker.cc_mtx);
-}
-
-void
-wg_cookie_init(struct wg_cookie *cookie)
-{
-	bzero(cookie, sizeof(*cookie));
-	mtx_init(&cookie->c_mtx, "cookie lock", NULL, MTX_DEF);
-}
-
-void
-wg_cookie_precompute_peer_keys(struct wg_peer *peer)
-{
-	mtx_lock(&peer->p_cookie.c_mtx);
-	wg_precompute_key(peer->p_cookie.c_decryption_key,
-			peer->p_remote.r_public, COOKIE_KEY_LABEL);
-	wg_precompute_key(peer->p_cookie.c_message_mac1_key,
-			peer->p_remote.r_public, MAC1_KEY_LABEL);
-	mtx_unlock(&peer->p_cookie.c_mtx);
-}
-
-void
-wg_compute_mac1(uint8_t mac1[WG_COOKIE_SIZE], const void *message, size_t len,
-    const uint8_t key[WG_KEY_SIZE])
-{
-	size_t mlen = len - sizeof(struct wg_pkt_macs) +
-	      offsetof(struct wg_pkt_macs, mac1);
-
-	blake2s(mac1, message, key, WG_COOKIE_SIZE, mlen, WG_KEY_SIZE);
-}
-
-void
-wg_compute_mac2(uint8_t mac2[WG_COOKIE_SIZE], const void *message, size_t len,
-    const uint8_t cookie[WG_COOKIE_SIZE])
-{
-	len = len - sizeof(struct wg_pkt_macs) +
-	      offsetof(struct wg_pkt_macs, mac2);
-	blake2s(mac2, message, cookie, WG_COOKIE_SIZE, len, WG_COOKIE_SIZE);
-}
-
-void
-wg_make_cookie(uint8_t cookie[WG_COOKIE_SIZE], struct wg_endpoint *e,
-    struct wg_cookie_checker *checker)
-{
-	struct blake2s_state state;
-
-	if (wg_timers_expired(&checker->cc_secret_birthdate,
-				COOKIE_SECRET_MAX_AGE, 0)) {
-		arc4random_buf(checker->cc_secret, WG_HASH_SIZE);
-		getnanotime(&checker->cc_secret_birthdate);
-	}
-
-	blake2s_init_key(&state, WG_COOKIE_SIZE, checker->cc_secret,
-			 WG_HASH_SIZE);
-
-	if (e->e_remote.r_sa.sa_family == AF_INET) {
-		blake2s_update(&state, (uint8_t *)&e->e_remote.r_sin.sin_addr,
-			       sizeof(struct in_addr));
-		blake2s_update(&state, (uint8_t *)&e->e_remote.r_sin.sin_port,
-			       sizeof(in_port_t));
-	} else if (e->e_remote.r_sa.sa_family == AF_INET6) {
-		blake2s_update(&state, (uint8_t *)&e->e_remote.r_sin6.sin6_addr,
-			       sizeof(struct in6_addr));
-		blake2s_update(&state, (uint8_t *)&e->e_remote.r_sin6.sin6_port,
-			       sizeof(in_port_t));
-	} else {
-		panic("how did we receive this packet?");
-	}
-
-	blake2s_final(&state, cookie, WG_COOKIE_SIZE);
-}
-
-enum wg_cookie_mac_state
-wg_cookie_validate_packet(struct wg_cookie_checker *checker, struct mbuf *m,
-    int check_cookie)
+int
+wg_cookie_validate_packet(struct cookie_checker *checker, struct mbuf *m,
+    int under_load)
 {
 	struct wg_endpoint *e;
-	uint8_t cookie[WG_COOKIE_SIZE];
-	uint8_t computed_mac[WG_COOKIE_SIZE];
-	enum wg_cookie_mac_state ret = INVALID_MAC;
-	struct wg_pkt_macs *macs = (struct wg_pkt_macs *)
-		(mtod(m, uint8_t *) + m->m_pkthdr.len - sizeof(*macs));
+	void *data;
+	struct wg_pkt_initiation	*init;
+	struct wg_pkt_response	*resp;
+	struct cookie_macs *macs;
+	int type, size;
 
-	mtx_lock(&checker->cc_mtx);
-	wg_compute_mac1(computed_mac, mtod(m, uint8_t *), m->m_pkthdr.len,
-	    checker->cc_message_mac1_key);
-	if (timingsafe_bcmp(computed_mac, macs->mac1, WG_COOKIE_SIZE)) {
-		goto out;
-	}
-	ret = VALID_MAC_BUT_NO_COOKIE;
-
-	if (!check_cookie)
-		goto out;
-
+	type = le32toh(*mtod(m, uint32_t *));
+	data = m->m_data;
 	e = wg_mbuf_endpoint_get(m);
-	wg_make_cookie(cookie, e, checker);
+	if (type == MESSAGE_HANDSHAKE_INITIATION) {
+		init = mtod(m, struct wg_pkt_initiation *);
+		macs = &init->m;
+		size = sizeof(*init) - sizeof(*macs);
+	} else if (type == MESSAGE_HANDSHAKE_RESPONSE) {
+		resp = mtod(m, struct wg_pkt_response *);
+		macs = &resp->m;
+		size = sizeof(*resp) - sizeof(*macs);
+	} else
+		return EINVAL;
 
-	wg_compute_mac2(computed_mac, mtod(m, uint8_t *), m->m_pkthdr.len,
-	    cookie);
-	if (timingsafe_bcmp(computed_mac, macs->mac2, WG_COOKIE_SIZE)) {
-		goto out;
-	}
-	ret = VALID_MAC_WITH_COOKIE_BUT_RATELIMITED;
-	if (wg_ratelimiter_allow(NULL, m) != 0) {
-		goto out;
-	}
-	ret = VALID_MAC_WITH_COOKIE;
-out:
-	mtx_unlock(&checker->cc_mtx);
-	return ret;
+	return (cookie_checker_validate_macs(checker, macs, data, size,
+	    under_load, &e->e_remote.r_sa));
 }
 
 void
-wg_cookie_add_mac_to_packet(struct wg_cookie *cookie, void *message, size_t len)
+wg_cookie_message_consume(struct wg_pkt_cookie *cook, struct wg_softc *sc)
 {
-	struct wg_pkt_macs *macs = (struct wg_pkt_macs *)
-		((uint8_t *)message + len - sizeof(*macs));
-
-	mtx_lock(&cookie->c_mtx);
-	wg_compute_mac1(macs->mac1, message, len, cookie->c_message_mac1_key);
-	memcpy(cookie->c_last_mac1_sent, macs->mac1, WG_COOKIE_SIZE);
-	cookie->c_have_sent_mac1 = 1;
-
-	if (!wg_timers_expired(&cookie->c_birthdate,
-	    COOKIE_SECRET_MAX_AGE - COOKIE_SECRET_LATENCY, 0))
-		wg_compute_mac2(macs->mac2, message, len, cookie->c_cookie);
-	else
-		bzero(macs->mac2, WG_COOKIE_SIZE);
-	mtx_unlock(&cookie->c_mtx);
-}
-
-void
-wg_cookie_message_create(struct wg_pkt_cookie *dst, struct mbuf *m,
-		uint32_t index, struct wg_cookie_checker *checker)
-{
-	struct wg_endpoint *e;
-	struct wg_pkt_macs *macs = (struct wg_pkt_macs *)
-		(mtod(m, uint8_t *) + m->m_pkthdr.len - sizeof(*macs));
-	uint8_t cookie[WG_COOKIE_SIZE];
-
-	dst->header.type = htole32(MESSAGE_HANDSHAKE_COOKIE);
-	dst->receiver_index = index;
-	arc4random_buf(dst->nonce, WG_XNONCE_SIZE);
-
-	e = wg_mbuf_endpoint_get(m);
-
-	mtx_lock(&checker->cc_mtx);
-	wg_make_cookie(cookie, e, checker);
-	xchacha20poly1305_encrypt(dst->encrypted_cookie, cookie, WG_COOKIE_SIZE,
-			  macs->mac1, WG_MAC_SIZE, dst->nonce,
-			  checker->cc_cookie_key);
-	mtx_unlock(&checker->cc_mtx);
-
-	explicit_bzero(cookie, sizeof(cookie));
-}
-
-void
-wg_cookie_message_consume(struct wg_pkt_cookie *src, struct wg_softc *sc)
-{
+	struct noise_remote		*remote;
 	struct wg_peer *peer;
-	struct noise_keypair *keypair;
-	uint8_t cookie[WG_COOKIE_SIZE];
 
-	if ((keypair = wg_hashtable_keypair_lookup(&sc->sc_hashtable,
-			src->receiver_index)) == NULL)
-		return;
+		if ((remote = wg_index_get(sc, cook->r_idx)) == NULL) {
+			DPRINTF(sc, "Unknown cookie index\n");
+			return;
+		}
 
-	peer = keypair->k_peer;
-
-	mtx_lock(&peer->p_cookie.c_mtx);
-
-	if (!peer->p_cookie.c_have_sent_mac1)
-		goto out;
-
-	if (xchacha20poly1305_decrypt(cookie, src->encrypted_cookie,
-			sizeof(src->encrypted_cookie),
-			peer->p_cookie.c_last_mac1_sent, WG_MAC_SIZE,
-			src->nonce, peer->p_cookie.c_decryption_key) != 0) {
-		DPRINTF(sc, "Could not decrypt invalid cookie response\n");
-		goto out;
-	}
-
-	memcpy(peer->p_cookie.c_cookie, cookie, WG_COOKIE_SIZE);
-	getnanotime(&peer->p_cookie.c_birthdate);
-	peer->p_cookie.c_have_sent_mac1 = 0;
-
-out:
-	mtx_unlock(&peer->p_cookie.c_mtx);
-	explicit_bzero(cookie, sizeof(cookie));
-	noise_keypair_put(keypair);
+		peer = CONTAINER_OF(remote, struct wg_peer, p_remote);
+		cookie_maker_consume_payload(&peer->p_cookie,
+									 cook->nonce, cook->ec);
 }
 
 /* Peer */
@@ -2346,13 +1370,11 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 
 	refcount_init(&peer->p_refcnt, 0);
 
-	noise_remote_init(&peer->p_remote, wpci->wpci_pub_key);
+	noise_remote_init(&peer->p_remote, __DECONST(uint8_t *, wpci->wpci_pub_key), &sc->sc_local);
 
 	wg_peer_magic_set(peer);
-	wg_cookie_init(&peer->p_cookie);
-	wg_cookie_precompute_peer_keys(peer);
+	cookie_maker_init(&peer->p_cookie, __DECONST(uint8_t *, wpci->wpci_pub_key));
 	wg_peer_timers_init(peer);
-	noise_keypairs_init(&peer->p_keypairs);
 
 	rw_init(&peer->p_endpoint_lock, "wg_peer_endpoint");
 	mtx_init(&peer->p_lock, "peer lock", NULL, MTX_DEF);
@@ -2371,7 +1393,7 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	GROUPTASK_INIT(&peer->p_recv, 0, (gtask_fn_t *)wg_peer_recv, peer);
 	taskqgroup_attach(qgroup_if_io_tqg, &peer->p_recv, peer, dev, NULL, "wg recv");
 	GROUPTASK_INIT(&peer->p_tx_initiation, 0,
-	    (gtask_fn_t *)wg_peer_send_handshake_initiation, peer);
+	    (gtask_fn_t *)wg_send_initiation, peer);
 	taskqgroup_attach(qgroup_if_io_tqg, &peer->p_tx_initiation, peer, dev, NULL, "wg tx initiation");
 
 	peer->p_tx_bytes = counter_u64_alloc(M_WAITOK);
@@ -2419,8 +1441,6 @@ wg_peer_destroy(struct wg_peer **peer_p)
 		wg_route_delete(&peer->p_sc->sc_routes, peer, &route->r_cidr);
 	MPASS(CK_LIST_EMPTY(&peer->p_routes));
 
-	noise_keypairs_clear(&peer->p_keypairs);
-
 	wg_peer_flush_staged_packets(peer);
 
 	/* TODO currently, if there is a timer added after here, then the peer
@@ -2458,13 +1478,13 @@ void
 wg_peer_queue_handshake_initiation(struct wg_peer *peer, int is_retry)
 {
 	if (!is_retry)
-		peer->p_timers.t_handshake_attempts = 0;
+		peer->p_timers.t_handshake_retries = 0;
 	/*
 	 * We check last_sent_handshake here in addition to the actual task
 	 * we're queueing up, so that we don't queue things if not strictly
 	 * necessary:
 	 */
-	if (!wg_timers_expired(&peer->p_timers.t_last_sent_handshake,
+	if (!wg_timers_expired(&peer->p_timers.t_handshake_complete,
 				REKEY_TIMEOUT, 0))
 		return; /* This function is rate limited. */
 
@@ -2472,77 +1492,66 @@ wg_peer_queue_handshake_initiation(struct wg_peer *peer, int is_retry)
 }
 
 void
-wg_peer_send_handshake_initiation(struct wg_peer *peer)
+wg_send_initiation(struct wg_peer *peer)
 {
-	struct wg_pkt_initiation init;
+	struct wg_pkt_initiation pkt;
 	struct epoch_tracker et;
-
-	rw_wlock(&peer->p_timers.t_lock);
-	if (!wg_timers_expired(&peer->p_timers.t_last_sent_handshake,
-				REKEY_TIMEOUT, 0)) {
-		rw_wunlock(&peer->p_timers.t_lock);
-		return;
-	}
-	getnanotime(&peer->p_timers.t_last_sent_handshake);
-	rw_wunlock(&peer->p_timers.t_lock);
-
-	DPRINTF(peer->p_sc, "Sending handshake initiation to peer %lu\n",
-			peer->p_id);
+	int ret;
 
 	NET_EPOCH_ENTER(et);
-	if (noise_handshake_create_initiation(&init, peer) == 0) {
-		wg_cookie_add_mac_to_packet(&peer->p_cookie, &init,
-					    sizeof(init));
-		wg_peer_timers_any_authenticated_packet_traversal(peer);
-		wg_peer_timers_any_authenticated_packet_sent(peer);
-
-		wg_peer_enqueue_buffer(peer, &init, sizeof(init));
-		wg_peer_timers_handshake_initiated(peer);
-	}
+	ret = noise_create_initiation(&peer->p_remote, &pkt.init);
+	if (ret)
+		goto out;
+	pkt.t = le32toh(MESSAGE_HANDSHAKE_INITIATION);
+	cookie_maker_mac(&peer->p_cookie, &pkt.m, &pkt,
+	    sizeof(pkt)-sizeof(pkt.m));
+	wg_peer_enqueue_buffer(peer, &pkt, sizeof(pkt));
+	wg_peer_timers_handshake_initiated(peer);
+out:
 	NET_EPOCH_EXIT(et);
 }
 
-void
-wg_peer_send_handshake_response(struct wg_peer *peer)
+static int
+wg_send_response(struct wg_peer *peer)
 {
-	struct wg_pkt_response resp;
+	struct wg_pkt_response pkt;
 	struct epoch_tracker et;
+	int ret;
 
-	rw_wlock(&peer->p_timers.t_lock);
-	getnanotime(&peer->p_timers.t_last_sent_handshake);
-	rw_wunlock(&peer->p_timers.t_lock);
+	NET_EPOCH_ENTER(et);
 
 	DPRINTF(peer->p_sc, "Sending handshake response to peer %lu\n",
 			peer->p_id);
 
-	NET_EPOCH_ENTER(et);
-	if (noise_handshake_create_response(&resp, peer) == 0) {
-		wg_cookie_add_mac_to_packet(&peer->p_cookie, &resp,
-					    sizeof(resp));
-		if (noise_keypairs_begin_session(&peer->p_keypairs) == 0) {
-			wg_peer_timers_session_derived(peer);
-			wg_peer_timers_any_authenticated_packet_traversal(peer);
-			wg_peer_timers_any_authenticated_packet_sent(peer);
-
-			wg_peer_enqueue_buffer(peer, &resp, sizeof(resp));
-		}
-	}
+	ret = noise_create_response(&peer->p_remote, &pkt.resp);
+	if (ret)
+		goto out;
+	pkt.t = MESSAGE_HANDSHAKE_RESPONSE;
+	cookie_maker_mac(&peer->p_cookie, &pkt.m, &pkt,
+	     sizeof(pkt)-sizeof(pkt.m));
+	wg_peer_enqueue_buffer(peer, &pkt, sizeof(pkt));
+	wg_timers_event_handshake_responded(&peer->p_timers);
+out:
 	NET_EPOCH_EXIT(et);
-
+	return (ret);
 }
 
 void
-wg_softc_send_handshake_cookie(struct wg_softc *sc, struct mbuf *m,
-			       uint32_t index)
+wg_send_cookie(struct wg_softc *sc, struct cookie_macs *cm, uint32_t idx,
+    struct mbuf *m)
 {
+	struct wg_pkt_cookie	pkt;
 	struct wg_endpoint *e;
-	struct wg_pkt_cookie cookie;
 
 	DPRINTF(sc, "Sending cookie response for denied handshake message\n");
 
+	pkt.t = le32toh(MESSAGE_HANDSHAKE_COOKIE);
+	pkt.r_idx = idx;
+
 	e = wg_mbuf_endpoint_get(m);
-	wg_cookie_message_create(&cookie, m, index, &sc->sc_cookie_checker);
-	wg_socket_send_buffer(&sc->sc_socket, &cookie, sizeof(cookie), e);
+	cookie_checker_create_payload(&sc->sc_cookie, cm, pkt.nonce,
+	    pkt.ec, &e->e_remote.r_sa);
+	wg_socket_send_buffer(&sc->sc_socket, &pkt, sizeof(pkt), e);
 }
 
 void
@@ -2695,7 +1704,6 @@ void
 wg_peer_send_staged_packets(struct wg_peer *peer)
 {
 	struct wg_softc *sc = peer->p_sc;
-	struct noise_keypair *keypair;
 	struct wg_queue_pkt *pkt;
 	struct mbufq mq;
 	struct mbuf *m;
@@ -2711,14 +1719,6 @@ wg_peer_send_staged_packets(struct wg_peer *peer)
 	mtx_lock(&peer->p_lock);
 	mbufq_concat(&mq, &peer->p_staged_packets);
 	mtx_unlock(&peer->p_lock);
-	/* First we make sure we have a valid reference to a valid key. */
-	/* XXX determine lifecycle management - epoch? */
-	keypair = noise_keypairs_lookup(&peer->p_keypairs,
-	    NOISE_KEYPAIR_CURRENT);
-
-	if (keypair == NULL || wg_timers_expired(&keypair->k_birthdate,
-						 REJECT_AFTER_TIME, 0))
-		goto invalid;
 
 	/*
 	 * After we know we have a somewhat valid key, we now try to assign
@@ -2731,29 +1731,12 @@ wg_peer_send_staged_packets(struct wg_peer *peer)
 
 		pkt = wg_mbuf_pkt_get(m);
 		pkt->p_state = WG_PKT_STATE_CLEAR;
-		pkt->p_nonce = wg_counter_next(&keypair->k_counter);
-
-		if (pkt->p_nonce >= REJECT_AFTER_MESSAGES) {
-			wg_m_freem(m);
-			goto invalid;
-		}
-
-		pkt->p_keypair = noise_keypair_ref(keypair);
 
 		wg_pktq_enqueue(&sc->sc_encrypt_queue, &peer->p_send_queue,
 				pkt);
 	}
 
 	GROUPTASK_ENQUEUE(&sc->sc_encrypt);
-	noise_keypair_put(keypair);
-	return;
-invalid:
-	/*
-	 * If we're exiting because there's something wrong with the key, it
-	 * means we should initiate a new handshake.
-	 */
-	wg_peer_queue_handshake_initiation(peer, 0);
-	noise_keypair_put(keypair);
 }
 
 void
@@ -2951,19 +1934,22 @@ wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
 void
 wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 {
-	enum wg_cookie_mac_state mac_state;
-	struct noise_keypair *keypair;
 	struct wg_pkt_initiation *init;
 	struct wg_pkt_response *resp;
+	struct noise_remote	*remote;
+	struct wg_pkt_cookie		*cook;
+	struct wg_peer	*peer;
+
 	/* This is global, so that our load calculation applies to the whole
 	 * system. We don't care about races with it at all.
 	 */
 	static struct timespec last_under_load;
 	int packet_needs_cookie;
-	int under_load;
+	int under_load, res;
 
 	if (le32toh(*mtod(m, uint32_t *) )  == MESSAGE_HANDSHAKE_COOKIE) {
 		DPRINTF(sc, "Receiving cookie response\n");
+
 		wg_cookie_message_consume(mtod(m, struct wg_pkt_cookie *), sc);
 		goto free;
 	}
@@ -2975,75 +1961,94 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 	else if (last_under_load.tv_sec != 0)
 		under_load = !wg_timers_expired(&last_under_load, 1, 0);
 
-	mac_state = wg_cookie_validate_packet(&sc->sc_cookie_checker, m,
-					      under_load);
-	if ((under_load && mac_state == VALID_MAC_WITH_COOKIE) ||
-	    (!under_load && mac_state == VALID_MAC_BUT_NO_COOKIE))
-		packet_needs_cookie = 0;
-	else if (under_load && mac_state == VALID_MAC_BUT_NO_COOKIE)
-		packet_needs_cookie = 1;
-	else {
-		DPRINTF(sc, "Handshake packet ratelimited, dropping\n");
+    res = wg_cookie_validate_packet(&sc->sc_cookie, m,
+	    under_load);
+
+	if (res && res != EAGAIN)
 		goto free;
-	}
+	packet_needs_cookie = (res == EAGAIN);
 
 	switch (le32toh(*mtod(m, uint32_t *))) {
 	case MESSAGE_HANDSHAKE_INITIATION:
 		init = mtod(m, struct wg_pkt_initiation *);
 
 		if (packet_needs_cookie) {
-			wg_softc_send_handshake_cookie(sc, m,
-						       init->sender_index);
+			wg_send_cookie(sc, &init->m, init->init.s_idx, m);
 			return;
 		}
-		keypair = noise_handshake_consume_initiation(init, sc);
-		if (keypair == NULL) {
+		if (noise_consume_initiation(&sc->sc_local, &remote,
+		    &init->init) != 0) {
 			DPRINTF(sc, "Invalid handshake initiation");
 			goto free;
 		}
-		wg_peer_set_endpoint_from_mbuf(keypair->k_peer, m);
+
+		peer = CONTAINER_OF(remote, struct wg_peer, p_remote);
 		DPRINTF(sc, "Receiving handshake initiation from peer %lu\n",
-				keypair->k_peer->p_id);
-		wg_peer_send_handshake_response(keypair->k_peer);
+				peer->p_id);
+		res = wg_send_response(peer);
+		if (res == 0 && noise_remote_promote(&peer->p_remote) == 0)
+			wg_timers_event_session_derived(&peer->p_timers);
 		break;
 	case MESSAGE_HANDSHAKE_RESPONSE:
 		resp = mtod(m, struct wg_pkt_response *);
 
 		if (packet_needs_cookie) {
-			wg_softc_send_handshake_cookie(sc, m,
-						       resp->sender_index);
+			wg_send_cookie(sc, &resp->m, resp->resp.s_idx, m);
 			return;
 		}
-		keypair = noise_handshake_consume_response(resp, sc);
-		if (keypair == NULL) {
+
+		if ((remote = wg_index_get(sc, resp->resp.r_idx)) == NULL) {
+			DPRINTF(sc, "Unknown handshake response\n");
+			goto free;
+		}
+		peer = CONTAINER_OF(remote, struct wg_peer, p_remote);
+
+		if (noise_consume_response(remote, &resp->resp) != 0) {
 			DPRINTF(sc, "Invalid handshake response\n");
 			goto free;
 		}
-		wg_peer_set_endpoint_from_mbuf(keypair->k_peer, m);
+
 		DPRINTF(sc, "Receiving handshake response from peer %lu\n",
-				keypair->k_peer->p_id);
-		if (noise_keypairs_begin_session(
-					&keypair->k_peer->p_keypairs) == 0) {
-			wg_peer_timers_session_derived(keypair->k_peer);
-			wg_peer_timers_handshake_complete(keypair->k_peer);
+				peer->p_id);
+		counter_u64_add(peer->p_rx_bytes, sizeof(*resp));
+		wg_peer_set_endpoint_from_mbuf(peer, m);
+		if (noise_remote_promote(&peer->p_remote) == 0) {
+			wg_timers_event_session_derived(&peer->p_timers);
+			wg_timers_event_handshake_complete(&peer->p_timers);
 			/* Calling this function will either send any existing
 			 * packets in the queue and not send a keepalive, which
 			 * is the best case, Or, if there's nothing in the
 			 * queue, it will send a keepalive, in order to give
 			 * immediate confirmation of the session.
 			 */
-			wg_peer_send_keepalive(keypair->k_peer);
+			wg_peer_send_keepalive(peer);
 		}
 		break;
+	case MESSAGE_HANDSHAKE_COOKIE:
+		cook = mtod(m, struct wg_pkt_cookie *);
+
+		if ((remote = wg_index_get(sc, cook->r_idx)) == NULL) {
+			DPRINTF(sc, "Unknown cookie index\n");
+			goto free;
+		}
+
+		peer = CONTAINER_OF(remote, struct wg_peer, p_remote);
+
+		if (cookie_maker_consume_payload(&peer->p_cookie,
+		    cook->nonce, cook->ec) != 0) {
+			DPRINTF(sc, "Could not decrypt cookie response\n");
+			goto free;
+		}
+
+		DPRINTF(sc, "Receiving cookie response\n");
+		goto free;
+	default:
+		goto free;
 	}
+	MPASS(peer != NULL);
+	wg_peer_timers_any_authenticated_packet_received(&peer->p_timers);
+	wg_peer_timers_any_authenticated_packet_traversal(&peer->p_timers);
 
-	if (keypair == NULL)
-		panic("Wrong type of packet in handshake queue!");
-
-	wg_peer_timers_any_authenticated_packet_received(keypair->k_peer);
-	wg_peer_timers_any_authenticated_packet_traversal(keypair->k_peer);
-
-	noise_keypair_put(keypair);
 free:
 	wg_m_freem(m);
 }
@@ -3057,35 +2062,6 @@ noise_timer_expired(struct timespec *birthdate, time_t sec, long nsec)
 	getnanotime(&time);
 	timespecsub(&time, &diff, &time);
 	return timespeccmp(birthdate, &time, <) ? ETIMEDOUT : 0;
-}
-
-static uint64_t
-noise_keypair_counter_send(struct noise_keypair *kp)
-{
-	return atomic_fetchadd_long(&kp->k_counter.c_send, 1);
-}
-
-static int
-noise_keypair_encrypt(struct noise_keypair *kp, uint8_t *buf, size_t len, uint64_t *nonce)
-{
-	uint64_t ctr;
-
-	NET_EPOCH_ASSERT();
-
-	if (kp->k_state != KEYPAIR_INITIATOR &&
-	    kp->k_state != KEYPAIR_RESPONDER)
-		return ENOTCONN;
-
-	if (noise_timer_expired(&kp->k_birthdate, REJECT_AFTER_TIME, 0) ||
-	    kp->k_counter.c_recv >= REJECT_AFTER_MESSAGES ||
-	    ((ctr = noise_keypair_counter_send(kp)) > REJECT_AFTER_MESSAGES))
-		return ETIMEDOUT;
-
-	*nonce = htole64(ctr);
-
-	chacha20poly1305_encrypt(buf, buf, len, NULL, 0, *nonce, kp->k_send);
-
-	return 0;
 }
 
 static void
@@ -3105,13 +2081,14 @@ wg_queue_pkt_encrypt(struct wg_queue_pkt *pkt)
 {
 	struct wg_pkt_data *data;
 	size_t padding_len, plaintext_len, out_len;
-	struct noise_keypair *kp;
 	struct mbuf *mc, *m = pkt->p_pkt;
 	struct wg_peer *peer;
+	struct wg_tag *t;
+	int res;
 
 	NET_EPOCH_ASSERT();
-	peer = pkt->p_keypair->k_peer;
-	kp = peer->p_keypairs.kp_current_keypair;
+	t = wg_tag_get(m);
+	peer = t->t_peer;
 
 	verify_peer_magic(peer);
 
@@ -3125,29 +2102,30 @@ wg_queue_pkt_encrypt(struct wg_queue_pkt *pkt)
 	}
 
 	data = mtod(mc, struct wg_pkt_data *);
-	m_copydata(m, 0, m->m_pkthdr.len, data->buf);
-	bzero(data->buf + m->m_pkthdr.len, padding_len);
+	m_copydata(m, 0, m->m_pkthdr.len, data->data.buf);
+	bzero(data->data.buf + m->m_pkthdr.len, padding_len);
 
-	data->header.type = htole32(MESSAGE_DATA);
-	data->receiver_index = kp->k_remote_index;
+	data->t = htole32(MESSAGE_DATA);
 
-	if (noise_keypair_encrypt(kp, data->buf, plaintext_len, &data->nonce) != 0) {
-		pkt->p_state = WG_PKT_STATE_DEAD;
-		m_freem(mc);
-		goto error;
+	res = noise_remote_encrypt(&peer->p_remote, &data->data, plaintext_len);
+
+	if (__predict_false(res)) {
+		if (res == EINVAL) {
+			wg_timers_event_want_initiation(&peer->p_timers);
+			m_freem(mc);
+			goto error;
+		} else if (res == ESTALE) {
+			wg_timers_event_want_initiation(&peer->p_timers);
+		} else 
+			panic("unexpected result: %d\n", res);
 	}
+
 
 	M_MOVE_PKTHDR(mc, m);
 	mc->m_len = out_len;
 	m_calchdrlen(mc);
 
-	wg_peer_timers_any_authenticated_packet_traversal(peer);
-	wg_peer_timers_any_authenticated_packet_sent(peer);
-	if (m->m_pkthdr.len > 0)
-		wg_peer_timers_data_sent(peer);
-
-	noise_keypairs_keep_key_fresh_send(peer);
-
+	counter_u64_add(peer->p_tx_bytes, m->m_pkthdr.len);
 	if (wg_peer_mbuf_add_ipudp(peer, &mc) == 0)
 		pkt->p_state = WG_PKT_STATE_CRYPTED;
 
@@ -3163,52 +2141,26 @@ wg_queue_pkt_decrypt(struct wg_queue_pkt *pkt)
 	struct mbuf *m = pkt->p_pkt;
 	struct wg_pkt_data *data;
 	struct wg_peer *peer, *routed_peer;
-	struct noise_keypair *keypair;
+	struct wg_tag *t;
 	size_t plaintext_len;
 	uint8_t version;
+	int res;
 
 	NET_EPOCH_ASSERT();
 	data = mtod(m, struct wg_pkt_data *);
 	plaintext_len = m->m_pkthdr.len - sizeof(struct wg_pkt_data);
 
-	keypair = pkt->p_keypair;
-	peer = keypair->k_peer;
+	t = wg_tag_get(m);
+	peer = t->t_peer;
 
-	pkt->p_nonce = le64toh(data->nonce);
-
-	if (wg_timers_expired(&keypair->k_birthdate, REJECT_AFTER_TIME, 0) ||
-			keypair->k_counter.c_recv >= REJECT_AFTER_MESSAGES)
-		goto drop;
-
-	if (!chacha20poly1305_decrypt(data->buf, data->buf, plaintext_len,
-				NULL, 0, data->nonce, pkt->p_keypair->k_recv))
-		goto drop;
-
-	if (wg_counter_validate(&keypair->k_counter, pkt->p_nonce) != 0) {
-		DPRINTF(peer->p_sc, "Packet has invalid nonce %lu (max "
-			"%lu), from peer %lu\n", pkt->p_nonce,
-			keypair->k_counter.c_recv, peer->p_id);
-		goto drop;
-	}
-
+	res = noise_remote_decrypt(&peer->p_remote, &data->data, plaintext_len);
 	wg_peer_set_endpoint_from_mbuf(peer, m);
-
-	if (noise_keypairs_received_with_keypair(
-				&peer->p_keypairs, keypair) == 0) {
-		wg_peer_timers_handshake_complete(peer);
-		wg_peer_send_staged_packets(peer);
-	}
-
-	noise_keypair_put(pkt->p_keypair);
+	counter_u64_add(peer->p_rx_bytes, m->m_pkthdr.len);
 
 	/* Remove the data header, and crypto mac tail from the packet */
 	m_adj(m, sizeof(struct wg_pkt_data));
 	m_adj(m, -WG_MAC_SIZE);
 
-	noise_keypairs_keep_key_fresh_recv(&peer->p_keypairs);
-
-	wg_peer_timers_any_authenticated_packet_received(peer);
-	wg_peer_timers_any_authenticated_packet_traversal(peer);
 
 	/* A packet with length 0 is a keepalive packet */
 	if (m->m_pkthdr.len == 0) {
@@ -3274,13 +2226,6 @@ wg_softc_encrypt(struct wg_softc *sc)
 
 	NET_EPOCH_ENTER(et);
 	while ((p = wg_pktq_parallel_dequeue(&sc->sc_encrypt_queue)) != NULL) {
-#ifdef INVARIANTS
-		struct wg_endpoint *e;
-
-		peer = p->p_keypair->k_peer;
-		e = wg_mbuf_endpoint_get(p->p_pkt);
-		MPASS(peer->p_endpoint.e_remote.r_sa.sa_family != 0);
-#endif
 		peer = wg_queue_pkt_encrypt(p);
 		wg_pktq_pkt_done(p);
 		GROUPTASK_ENQUEUE(&peer->p_send);
@@ -3288,103 +2233,48 @@ wg_softc_encrypt(struct wg_softc *sc)
 	NET_EPOCH_EXIT(et);
 }
 
+static struct noise_remote *
+wg_index_get(struct wg_softc *sc, uint32_t key0)
+{
 #if 0
-/* Interface */
-void
-wg_start(struct ifqueue *ifq)
-{
-	struct mbuf *m;
-	struct wg_peer *peer;
-	struct wg_softc *sc = ifq->ifq_if->if_softc;
+	struct wg_index		*iter;
+	struct noise_remote	*remote = NULL;
+	uint32_t		 key = key0 & sc->sc_index_mask;
 
-	while((m = ifq_dequeue(ifq)) != NULL) {
-		if ((peer = wg_route_lookup(&sc->sc_routes, m, OUT)) == NULL) {
-
-			//if_inc_counter(sc->sc_ifp, ifc_oerrors);
-			wg_m_freem(m);
-			continue;
+	rw_enter_read(&sc->sc_index_lock);
+	LIST_FOREACH(iter, &sc->sc_index[key], i_entry)
+		if (iter->i_key == key0) {
+			remote = iter->i_value;
+			break;
 		}
-
-		if (mbufq_enqueue(&peer->p_staged_packets, m) != 0)
-			if_inc_counter(sc->sc_ifp, IFCOUNTER_OQDROPS, 1);
-
-		if (mbufq_len(&peer->p_staged_packets) > MAX_STAGED_PACKETS/8) {
-			gtaskqueue_cancel(peer->p_send_staged.gt_taskqueue,
-							  peer->p_send_staged.gt_task);
-			wg_peer_send_staged_packets(peer);
-		} else {
-			GROUPTASK_ENQUEUE(&peer->p_send_staged);
-		}
-
-		wg_peer_put(peer);
-	}
-}
-
-int
-wg_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *sa,
-	  struct rtentry *rt)
-{
-	int err = 0;
-	struct wg_peer *peer;
-	struct wg_queue_pkt *pkt;
-	struct wg_softc *sc = ifp->if_softc;
-
-	if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6) {
-		wg_m_freem(m);
-		if_inc_counter(sc->sc_ifp, IFCOUNTER_NOPROTO, 1);
-		DPRINTF(sc, "Invalid IP packet\n");
-		return EAFNOSUPPORT;
-	}
-
-	if ((peer = wg_route_lookup(&sc->sc_routes, m, OUT)) == NULL) {
-		if (m->m_pkthdr.ph_family == AF_INET) {
-			DPRINTF(sc, "No peer has allowed IPs matching IPv4\n");
-			icmp_error(m, ICMP_UNREACH, ICMP_UNREACH_HOST, 0, 0);
-		} else if (m->m_pkthdr.ph_family == AF_INET6) {
-			DPRINTF(sc, "No peer has allowed IPs matching IPv6\n");
-			icmp6_error(m, ICMP6_DST_UNREACH,
-				   ICMP6_DST_UNREACH_ADDR, 0);
-		} else {
-			wg_m_freem(m);
-		}
-		return ENETUNREACH;
-	}
-
-	if (peer->p_endpoint.e_remote.r_sa.sa_family != AF_INET &&
-	    peer->p_endpoint.e_remote.r_sa.sa_family != AF_INET6) {
-		DPRINTF(sc, "No valid endpoint has been configured or "
-				"discovered for peer %lu\n", peer->p_id);
-		wg_m_freem(m);
-		wg_peer_put(peer);
-		return EDESTADDRREQ;
-	}
-
-	pkt = wg_mbuf_pkt_get(m);
-
-	if (pkt->p_state != WG_PKT_STATE_NEW) {
-		DPRINTF(sc, "Dropping packet as wg-over-wg is not supported\n");
-		if (m->m_pkthdr.ph_family == AF_INET)
-			icmp_error(m, ICMP_UNREACH, ICMP_UNREACH_HOST, 0, 0);
-		else if (m->m_pkthdr.ph_family == AF_INET6)
-			icmp6_error(m, ICMP6_DST_UNREACH,
-				    ICMP6_DST_UNREACH_ADDR, 0);
-		else
-			wg_m_freem(m);
-		wg_peer_put(peer);
-		return ELOOP;
-	}
-
-	/* We don't want to hold a reference to peer at all while the mbuf is
-	 * stored on the if_queue, as it may be freed without our knowledge,
-	 * resulting in a leak. */
-	if ((err = if_enqueue(&sc->sc_if, m)) != 0)
-		if_inc_counter(sc->sc_ifp, IFCOUNTER_OQDROPS);
-
-	wg_peer_put(peer);
-
-	return err;
-}
+	rw_exit_read(&sc->sc_index_lock);
+	return remote;
 #endif
+	return NULL;
+}
+
+static void
+wg_index_drop(struct wg_softc *sc, uint32_t key0)
+{
+#if 0
+	struct wg_index	*iter;
+	struct wg_peer	*peer = NULL;
+	uint32_t	 key = key0 & sc->sc_index_mask;
+
+	rw_enter_write(&sc->sc_index_lock);
+	LIST_FOREACH(iter, &sc->sc_index[key], i_entry)
+		if (iter->i_key == key0) {
+			LIST_REMOVE(iter, i_entry);
+			break;
+		}
+	rw_exit_write(&sc->sc_index_lock);
+
+	/* We expect a peer */
+	peer = CONTAINER_OF(iter->i_value, struct wg_peer, p_remote);
+	KASSERT(peer != NULL);
+	SLIST_INSERT_HEAD(&peer->p_unused_index, iter, i_unused_entry);
+#endif
+}
 
 void
 wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
@@ -3398,6 +2288,8 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 	struct mbuf *m;
 	int pktlen, pkttype, hlen;
 	struct wg_pkt_header *hdr;
+	struct noise_remote *remote;
+	struct wg_tag *t;
 	void *data;
 
 	uh = (struct udphdr *)(m0->m_data + offset);
@@ -3413,6 +2305,7 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 	hdr = mtod(m, struct wg_pkt_header *);
 	pkttype = le32toh(hdr->type);
 	pkt = wg_mbuf_pkt_get(m);
+	t = wg_tag_get(m);
 	if (pkt == NULL) {
 		DPRINTF(sc, "no pkt\n");
 		goto free;
@@ -3441,20 +2334,22 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 	    && pkttype == MESSAGE_DATA) {
 
 		pkt_data = data;
-		pkt->p_keypair = wg_hashtable_keypair_lookup(&sc->sc_hashtable,
-				pkt_data->receiver_index);
-
-		if (pkt->p_keypair == NULL) {
+		remote = wg_index_get(sc, pkt_data->data.r_idx);
+		if (remote == NULL) {
 			if_inc_counter(sc->sc_ifp, IFCOUNTER_IERRORS, 1);
 			wg_m_freem(m);
 		} else if (wg_pktq_parallel_len(
 				&sc->sc_decrypt_queue) > MAX_QUEUED_PACKETS) {
 			if_inc_counter(sc->sc_ifp, IFCOUNTER_IQDROPS, 1);
-			noise_keypair_put(pkt->p_keypair);
 			wg_m_freem(m);
 		} else {
+			t->t_peer = CONTAINER_OF(remote, struct wg_peer,
+			    p_remote);
+			//t->t_mbuf = NULL;
+			t->t_done = 0;
+
 			wg_pktq_enqueue(&sc->sc_decrypt_queue,
-					&pkt->p_keypair->k_peer->p_recv_queue,
+					&t->t_peer->p_recv_queue,
 					pkt);
 			GROUPTASK_ENQUEUE(&sc->sc_decrypt);
 		}
@@ -3468,60 +2363,6 @@ free:
  * XXX
  */
 uint16_t default_port = 5000;
-
-#if 0
-int
-wg_clone_create(struct if_clone * ifc, int unit)
-{
-	int ret;
-	struct ifnet	*ifp;
-	struct wg_softc *sc;
-
-	/* softc */
-	if ((sc = malloc(sizeof(*sc), M_DEVBUF, M_ZERO | M_NOWAIT)) == NULL)
-		return ENOBUFS;
-
-	#if 0
-	if ((ret = wg_socket_init(&sc->sc_socket, default_port)) != 0)
-		return ret;
-#endif
-	wg_hashtable_init(&sc->sc_hashtable);
-	wg_route_init(&sc->sc_routes);
-
-	//sc->sc_taskq = taskq_create("wg_mp", ncpus, IPL_NET, TASKQ_MPSAFE);
-
-	wg_queue_parallel_init(&sc->sc_encrypt_queue, IPL_NET);
-	wg_queue_parallel_init(&sc->sc_decrypt_queue, IPL_NET);
-	task_set(&sc->sc_encrypt, (void (*)(void *))wg_softc_encrypt, sc);
-	task_set(&sc->sc_decrypt, (void (*)(void *))wg_softc_decrypt, sc);
-
-	/* ifnet */
-	ifp = &sc->sc_if;
-	ifp->if_softc = sc;
-
-	snprintf(ifp->if_xname, sizeof(ifp->if_xname), "wg%d", unit);
-
-	ifp->if_mtu = 1420;
-	ifp->if_flags = IFF_NOARP | IFF_MULTICAST | IFF_BROADCAST;
-	ifp->if_xflags = IFXF_CLONED | IFXF_MPSAFE;
-
-	ifp->if_ioctl = wg_ioctl;
-	ifp->if_output = wg_output;
-	ifp->if_qstart = wg_start;
-	ifp->if_rtrequest = p2p_rtrequest;
-
-	ifp->if_type = IFT_TUNNEL;
-	IFQ_SET_MAXLEN(&ifp->if_snd, IFQ_MAXLEN);
-
-	if_attach(ifp);
-	if_alloc_sadl(ifp);
-	if_counters_alloc(ifp);
-
-	DPRINTF(sc, "Interface created\n");
-
-	return 0;
-}
-#endif
 
 
 void

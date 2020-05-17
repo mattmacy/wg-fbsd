@@ -8,8 +8,12 @@
 #include <sys/malloc.h>
 #include <sys/proc.h>
 #include <sys/lock.h>
+#include <vm/uma.h>
 
 #include <machine/fpu.h>
+
+#include <crypto/siphash/siphash.h>
+
 
 #define COMPAT_ZINC_IS_A_MODULE
 MALLOC_DECLARE(M_WG);
@@ -24,6 +28,13 @@ MALLOC_DECLARE(M_WG);
 #define BITS_PER_LONG           32
 #endif
 
+#define rw_enter_write rw_wlock
+#define rw_exit_write rw_wunlock
+#define rw_enter_read rw_rlock
+#define rw_exit_read rw_runlock
+#define rw_exit rw_unlock
+
+#define ASSERT(x) MPASS(x)
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -39,9 +50,24 @@ typedef uint64_t  __le64;
 
 #define cpu_to_le64(x) htole64(x)
 #define cpu_to_le32(x) htole32(x)
-
+#define letoh64(x) le64toh(x)
 
 #define	need_resched() (curthread->td_flags & (TDF_NEEDRESCHED|TDF_ASTPENDING))
+
+#define CONTAINER_OF(a, b, c) __containerof((a), b, c)
+
+typedef struct {
+	uint64_t	k0;
+	uint64_t	k1;
+} SIPHASH_KEY;
+
+static inline uint64_t
+siphash24(const SIPHASH_KEY *key, const void *src, size_t len)
+{
+	SIPHASH_CTX ctx;
+
+	return (SipHashX(&ctx, 2, 4, (const uint8_t *)key, src, len));
+}
 
 static inline void
 put_unaligned_le32(u32 val, void *p)

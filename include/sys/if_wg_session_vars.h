@@ -25,7 +25,16 @@
 #include <sys/mutex.h>
 #include <crypto/siphash/siphash.h>
 
-#include <sys/wg_module.h>
+
+#include <net/if.h>
+#include <net/if_var.h>
+#include <net/if_types.h>
+#include <net/ethernet.h>
+#include <net/pfvar.h>
+#include <net/iflib.h>
+
+#include <sys/wg_noise.h>
+#include <sys/wg_cookie.h>
 /* This is only needed for wg_keypair. */
 #include <sys/if_wg_session.h>
 
@@ -42,7 +51,6 @@
 #define WG_PADDING_SIZE(n) ((-(n)) & (WG_MSG_PADDING_SIZE - 1))
 
 /* Constant for session */
-#define COUNTER_TYPE		int
 //#define COUNTER_BITS_TOTAL	256
 #define COUNTER_TYPE_BITS	(sizeof(COUNTER_TYPE) * 8)
 #define COUNTER_TYPE_NUM	(COUNTER_BITS_TOTAL / COUNTER_TYPE_BITS)
@@ -54,7 +62,6 @@
 #define REKEY_TIMEOUT_JITTER		500 /* TODO ok? jason */
 #define REKEY_AFTER_TIME		120
 #define REJECT_AFTER_TIME		180
-#define INITIATIONS_PER_SECOND		5 /* TODO ok? jason (50 on linux) */
 #define MAX_PEERS_PER_DEVICE		(1u << 20)
 #define KEEPALIVE_TIMEOUT		10
 #define MAX_TIMER_HANDSHAKES		(90 / REKEY_TIMEOUT)
@@ -72,6 +79,15 @@
 #define PEER_MAGIC1	0xCAFEBABEB00FDADDULL
 #define PEER_MAGIC2	0xCAAFD0D0D00DBABEULL
 #define PEER_MAGIC3	0xD00DBABEF00DFADEULL
+
+
+enum message_type {
+	MESSAGE_INVALID = 0,
+	MESSAGE_HANDSHAKE_INITIATION = 1,
+	MESSAGE_HANDSHAKE_RESPONSE = 2,
+	MESSAGE_HANDSHAKE_COOKIE = 3,
+	MESSAGE_DATA = 4
+};
 
 struct wg_softc;
 
@@ -102,66 +118,25 @@ struct wg_socket {
 };
 
 
-/* Packet */
+struct wg_timers {
+	/* t_lock is for blocking wg_timers_event_* when setting t_disabled. */
+	struct rwlock		 t_lock;
 
-void	wg_softc_decrypt(struct wg_softc *);
-void	wg_softc_encrypt(struct wg_softc *);
+	int			 t_disabled;
+	int			 t_need_another_keepalive;
+	uint16_t		 t_persistent_keepalive_interval;
+	struct callout		 t_new_handshake;
+	struct callout		 t_send_keepalive;
+	struct callout		 t_retry_handshake;
+	struct callout		 t_zero_key_material;
+	struct callout		 t_persistent_keepalive;
 
-struct wg_pkt_header {
-	uint32_t 	type;
-} __packed;
+	struct mtx		 t_handshake_mtx;
+	struct timeval		 t_handshake_touch;	/* microuptime */
+	struct timespec		 t_handshake_complete;	/* nanotime */
+	int			 t_handshake_retries;
 
-struct wg_pkt_macs {
-	uint8_t	mac1[WG_MAC_SIZE];
-	uint8_t	mac2[WG_MAC_SIZE];
-} __packed;
-
-struct wg_pkt_initiation {
-	struct wg_pkt_header 	header;
-	uint32_t 		sender_index;
-	uint8_t 		unencrypted_ephemeral[WG_KEY_SIZE];
-	uint8_t 		encrypted_static[WG_KEY_SIZE + WG_MAC_SIZE];
-	uint8_t 		encrypted_timestamp[WG_TIMESTAMP_SIZE + WG_MAC_SIZE];
-	struct wg_pkt_macs	macs;
-} __packed;
-
-struct wg_pkt_response {
-	struct wg_pkt_header 	header;
-	uint32_t 		sender_index;
-	uint32_t 		receiver_index;
-	uint8_t 		unencrypted_ephemeral[WG_KEY_SIZE];
-	uint8_t 		encrypted_nothing[0 + WG_MAC_SIZE];
-	struct wg_pkt_macs	macs;
-} __packed;
-
-struct wg_pkt_cookie {
-	struct wg_pkt_header	header;
-	uint32_t 		receiver_index;
-	uint8_t 		nonce[WG_XNONCE_SIZE];
-	uint8_t 		encrypted_cookie[WG_COOKIE_SIZE + WG_MAC_SIZE];
-} __packed;
-
-struct wg_pkt_data {
-	struct wg_pkt_header 	header;
-	uint32_t 		receiver_index;
-	uint64_t 		nonce;
-	uint8_t 		buf  [];
-} __packed;
-
-/* Queue */
-struct wg_queue_pkt {
-	struct noise_keypair		*p_keypair;
-	struct mbuf			*p_pkt;
-	STAILQ_ENTRY(wg_queue_pkt)	 p_serial;
-	STAILQ_ENTRY(wg_queue_pkt)	 p_parallel;
-	uint64_t			 p_nonce;
-	int				 p_done;
-	enum wg_pkt_state {
-		WG_PKT_STATE_NEW = 0,
-		WG_PKT_STATE_CRYPTED,
-		WG_PKT_STATE_CLEAR,
-		WG_PKT_STATE_DEAD,
-	}				 p_state;
+	//	struct wg_timers_fn	*t_fn; /* not locked/mutex'd */
 };
 
 struct wg_pktq {
@@ -170,183 +145,15 @@ struct wg_pktq {
 	STAILQ_HEAD(, wg_queue_pkt)	q_items;
 };
 
-#define MTAG_WIREGUARD 0xBEAD
-struct wg_tag {
-	struct m_tag wt_tag;
-	struct wg_endpoint wt_endpoint;
-	struct wg_queue_pkt wt_queue_pkt;
+#if 0
+struct wg_timers_fn {
+	void (*f_send_initiation)(struct wg_timers *, int, int);
+	void (*f_send_keepalive)(struct wg_timers *);
+	void (*f_clear_secrets)(struct wg_timers *);
+	void (*f_clear_staged)(struct wg_timers *);
+	void (*f_clear_src)(struct wg_timers *);
 };
-
-void		 	 wg_pktq_init(struct wg_pktq *, const char *);
-void		 	 wg_pktq_deinit(struct wg_pktq *);
-void		 	 wg_pktq_enqueue(struct wg_pktq *parallel, struct
-		wg_pktq *serial, struct wg_queue_pkt *);
-struct wg_queue_pkt	*wg_pktq_parallel_dequeue(struct wg_pktq *);
-struct wg_queue_pkt	*wg_pktq_serial_dequeue(struct wg_pktq *);
-size_t			 wg_pktq_parallel_len(struct wg_pktq *);
-
-
-/* Counter */
-struct wg_counter {
-	struct mtx	c_mtx;
-	uint64_t	c_send;
-	uint64_t	c_recv;
-	COUNTER_TYPE	c_backtrack[COUNTER_BITS_TOTAL / __LONG_BIT];
-};
-
-/* Timers */
-struct wg_timers {
-	struct rwlock	t_lock;
-	struct callout	t_retransmit_handshake;
-	struct callout	t_send_keepalive;
-	struct callout	t_new_handshake;
-	struct callout	t_zero_key_material;
-	struct callout	t_persistent_keepalive;
-	uint16_t	t_persistent_keepalive_interval;
-	uint8_t		t_handshake_attempts;
-	bool		t_need_another_keepalive;
-	bool		t_sent_lastminute_handshake;
-
-	struct timespec	t_last_handshake;
-	struct timespec	t_last_sent_handshake;
-};
-
-/* Route */
-enum route_direction {
-	IN,
-	OUT,
-};
-
-struct wg_route_table {
-	size_t 		 t_count;
-	struct radix_node_head	*t_ip;
-	struct radix_node_head	*t_ip6;
-};
-
-struct wg_route {
-	struct radix_node		 r_nodes[2];
-	CK_LIST_ENTRY(wg_route)	 r_entry;
-	struct wg_peer		*r_peer;
-	struct wg_allowedip		 r_cidr;
-};
-
-/* Noise */
-#define HANDSHAKE_NAME "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
-#define IDENTIFIER_NAME "WireGuard v1 zx2c4 Jason@zx2c4.com"
-
-/* TODO s/HANDSHAKE/KEYPAIR/g */
-
-enum noise_keypair_state {
-	HANDSHAKE_ZEROED = 0,
-	HANDSHAKE_CREATED_INITIATION,
-	HANDSHAKE_CONSUMED_INITIATION,
-	HANDSHAKE_CREATED_RESPONSE,
-	HANDSHAKE_CONSUMED_RESPONSE,
-	KEYPAIR_INITIATOR,
-	KEYPAIR_RESPONDER,
-};
-
-
-struct noise_keypair {
-	LIST_ENTRY(noise_keypair)	 k_entry;
-	volatile uint32_t			 k_refcnt;
-	uint64_t			 k_id;
-	struct wg_peer			*k_peer;
-
-	uint8_t				 k_send[WG_KEY_SIZE];
-	uint8_t				 k_recv[WG_KEY_SIZE];
-	uint32_t			 k_local_index;
-	uint32_t			 k_remote_index;
-
-	struct wg_counter		 k_counter;
-	struct timespec			 k_birthdate;
-
-	/* Mutex protects the following elements */
-	struct mtx			 k_mtx;
-	enum noise_keypair_state	 k_state;
-	uint8_t		 		 k_ephemeral_private[WG_KEY_SIZE];
-	uint8_t		 		 k_remote_ephemeral[WG_KEY_SIZE];
-	uint8_t		 		 k_hash[WG_HASH_SIZE];
-	uint8_t		 		 k_chaining_key[WG_HASH_SIZE];
-};
-
-enum noise_keypair_type {
-	NOISE_KEYPAIR_CURRENT,
-	NOISE_KEYPAIR_PREVIOUS,
-	NOISE_KEYPAIR_NEXT,
-};
-
-struct noise_keypairs {
-	struct mtx			 kp_mtx;
-	struct noise_keypair		*kp_current_keypair;
-	struct noise_keypair		*kp_previous_keypair;
-	struct noise_keypair		*kp_next_keypair;
-};
-
-struct noise_remote {
-	struct mtx	r_mtx;
-	uint8_t		r_public[WG_KEY_SIZE];
-	uint8_t		r_psk[WG_KEY_SIZE];
-	uint8_t		r_ts[WG_TIMESTAMP_SIZE];
-	struct timespec	r_last_init;
-};
-
-struct noise_local {
-	struct rwlock 	l_lock;
-	int		l_has_identity;
-	uint8_t		l_public[WG_KEY_SIZE];
-	uint8_t		l_private[WG_KEY_SIZE];
-};
-
-/* Ratelimiter */
-struct wg_ratelimiter;
-
-
-/* Cookie */
-#define MAC1_KEY_LABEL "mac1----"
-#define COOKIE_KEY_LABEL "cookie--"
-
-struct wg_cookie_checker {
-	struct mtx	cc_mtx;
-	uint8_t		cc_secret[WG_HASH_SIZE];
-	uint8_t		cc_cookie_key[WG_KEY_SIZE];
-	uint8_t		cc_message_mac1_key[WG_KEY_SIZE];
-	struct timespec cc_secret_birthdate;
-};
-
-struct wg_cookie {
-	struct mtx	c_mtx;
-	struct timespec	c_birthdate;
-	uint8_t		c_cookie[WG_COOKIE_SIZE];
-	int		c_have_sent_mac1;
-	uint8_t		c_last_mac1_sent[WG_MAC_SIZE];
-	uint8_t		c_decryption_key[WG_KEY_SIZE];
-	uint8_t		c_message_mac1_key[WG_KEY_SIZE];
-};
-
-enum wg_cookie_mac_state {
-	INVALID_MAC,
-	VALID_MAC_BUT_NO_COOKIE,
-	VALID_MAC_WITH_COOKIE_BUT_RATELIMITED,
-	VALID_MAC_WITH_COOKIE
-};
-
-/*
- * Peer
- *
- *
- *
- */
-
-struct wg_softc;
-
-struct wg_peer_create_info {
-	const void *wpci_pub_key;
-	const struct sockaddr *wpci_endpoint;
-	const struct wg_allowedip *wpci_allowedip_list;
-	int wpci_allowedip_count;
-};
-
+#endif
 struct wg_peer {
 	uint64_t p_magic_1;
 	CK_LIST_ENTRY(wg_peer)	 p_hash_entry;
@@ -356,9 +163,8 @@ struct wg_peer {
 	volatile uint32_t		 p_refcnt;
 
 	struct noise_remote	 p_remote;
-	struct wg_cookie	 p_cookie;
+	struct cookie_maker	 p_cookie;
 	struct wg_timers	 p_timers;
-	struct noise_keypairs	 p_keypairs;
 
 	struct rwlock		 p_endpoint_lock;
 	struct wg_endpoint	 p_endpoint;
@@ -383,6 +189,120 @@ struct wg_peer {
 	struct mtx p_lock;
 	struct epoch_context p_ctx;
 };
+
+
+
+/* Packet */
+
+void	wg_softc_decrypt(struct wg_softc *);
+void	wg_softc_encrypt(struct wg_softc *);
+
+struct wg_pkt_header {
+	uint32_t 	type;
+} __packed;
+
+/* Queue */
+struct wg_queue_pkt {
+	struct mbuf			*p_pkt;
+	STAILQ_ENTRY(wg_queue_pkt)	 p_serial;
+	STAILQ_ENTRY(wg_queue_pkt)	 p_parallel;
+	int				 p_done;
+	enum wg_pkt_state {
+		WG_PKT_STATE_NEW = 0,
+		WG_PKT_STATE_CRYPTED,
+		WG_PKT_STATE_CLEAR,
+		WG_PKT_STATE_DEAD,
+	}				 p_state;
+};
+
+
+void		 	 wg_pktq_init(struct wg_pktq *, const char *);
+void		 	 wg_pktq_deinit(struct wg_pktq *);
+void		 	 wg_pktq_enqueue(struct wg_pktq *parallel, struct
+		wg_pktq *serial, struct wg_queue_pkt *);
+struct wg_queue_pkt	*wg_pktq_parallel_dequeue(struct wg_pktq *);
+struct wg_queue_pkt	*wg_pktq_serial_dequeue(struct wg_pktq *);
+size_t			 wg_pktq_parallel_len(struct wg_pktq *);
+
+
+/* Counter */
+struct wg_counter {
+	struct mtx	c_mtx;
+	uint64_t	c_send;
+	uint64_t	c_recv;
+	COUNTER_TYPE	c_backtrack[COUNTER_BITS_TOTAL / __LONG_BIT];
+};
+
+/* Timers */
+#if 0
+struct wg_timers {
+	struct rwlock	t_lock;
+	struct callout	t_retransmit_handshake;
+	struct callout	t_send_keepalive;
+	struct callout	t_new_handshake;
+	struct callout	t_zero_key_material;
+	struct callout	t_persistent_keepalive;
+	uint16_t	t_persistent_keepalive_interval;
+	uint8_t		t_handshake_attempts;
+	bool		t_need_another_keepalive;
+	bool		t_sent_lastminute_handshake;
+
+	struct timeval		 t_handshake_touch;	/* microuptime */
+	struct timespec	t_handshake_complete;
+};
+#endif
+
+/* Route */
+enum route_direction {
+	IN,
+	OUT,
+};
+
+struct wg_route_table {
+	size_t 		 t_count;
+	struct radix_node_head	*t_ip;
+	struct radix_node_head	*t_ip6;
+};
+struct wg_peer;
+
+struct wg_route {
+	struct radix_node		 r_nodes[2];
+	CK_LIST_ENTRY(wg_route)	 r_entry;
+	struct wg_peer		*r_peer;
+	struct wg_allowedip		 r_cidr;
+};
+
+/* Noise */
+
+/* Ratelimiter */
+struct wg_ratelimiter;
+
+
+/* Cookie */
+struct wg_cookie_checker {
+	struct mtx	cc_mtx;
+	uint8_t		cc_secret[WG_HASH_SIZE];
+	uint8_t		cc_cookie_key[WG_KEY_SIZE];
+	uint8_t		cc_message_mac1_key[WG_KEY_SIZE];
+	struct timespec cc_secret_birthdate;
+};
+
+/*
+ * Peer
+ *
+ *
+ *
+ */
+
+struct wg_softc;
+
+struct wg_peer_create_info {
+	const void *wpci_pub_key;
+	const struct sockaddr *wpci_endpoint;
+	const struct wg_allowedip *wpci_allowedip_list;
+	int wpci_allowedip_count;
+};
+
 
 struct wg_hashtable {
 	struct mtx			 h_mtx;
@@ -412,7 +332,7 @@ struct wg_softc {
 	struct grouptask		 sc_handshake;
 
 	struct noise_local	 sc_local;
-	struct wg_cookie_checker sc_cookie_checker;
+	struct cookie_checker sc_cookie;
 
 	struct wg_pktq sc_encrypt_queue;
 	struct wg_pktq sc_decrypt_queue;
@@ -444,12 +364,6 @@ void wg_socket_reinit(struct wg_softc *, struct socket *so4,
     struct socket *so6);
 void wg_softc_handshake_receive(struct wg_softc *sc);
 
-void	wg_cookie_checker_init(struct wg_cookie_checker *);
 void wg_cookie_checker_precompute_device_keys(struct wg_softc *sc);
-
-void wg_noise_param_init(void);
-void noise_local_init(struct noise_local *local);
-void	noise_local_set_private(struct noise_local *,
-				const uint8_t [WG_KEY_SIZE]);
 
 #endif /* _IF_WG_VARS_H_ */
