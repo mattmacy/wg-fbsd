@@ -84,7 +84,7 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	nvlist_t *nvl;
 	void *packed;
 	struct noise_local *local;
-	struct noise_alloc	 local_alloc;
+	struct noise_upcall	 noise_upcall;
 	int err;
 	uint16_t listen_port;
 	const void *key;
@@ -127,7 +127,14 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	}
 
 	local = &sc->sc_local;
-	noise_local_init(local, &local_alloc);
+	noise_upcall.u_arg = sc;
+	noise_upcall.u_remote_get =
+		(struct noise_remote *(*)(void *, uint8_t *))wg_remote_get;
+	noise_upcall.u_index_set =
+		(uint32_t (*)(void *, struct noise_remote *))wg_index_set;
+	noise_upcall.u_index_drop =
+		(void (*)(void *, uint32_t))wg_index_drop;
+	noise_local_init(local, &noise_upcall);
 	cookie_checker_init(&sc->sc_cookie, wg_ratelimit_zone);
 
 	sc->sc_socket.so_port = listen_port;
@@ -257,7 +264,6 @@ wg_detach(if_ctx_t ctx)
 	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_encrypt);
 	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_decrypt);
 
-	rw_destroy(&sc->sc_local.l_lock);
 	atomic_add_int(&clone_count, -1);
 
 	return (0);

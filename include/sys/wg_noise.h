@@ -23,8 +23,8 @@
  *           Stores the local state for a noise peer.
  *   * noise_remote
  *           Stores the remote state for a noise peer.
- *   * noise_alloc
- *           Stores allocation routines for index and peers
+ *   * noise_upcall
+ *           Stores callback routines for index and peers
  *
  * Additionally a noise_counter, which is invsible to the user is used to track
  * message nonces, to prevent message replay.
@@ -41,7 +41,7 @@
  *
  * -------- noise_local --------
  *
- * void noise_local_init(noise_local *, noise_alloc *)
+ * void noise_local_init(noise_local *, noise_upcall *)
  *   - Initialise noise_local, should only be called once and before use.
  *
  * int noise_local_set_private(noise_local *, uint8_t *private)
@@ -64,19 +64,19 @@
  * void noise_remote_keys(noise_remote *, uint8_t *public, uint8_t *psk)
  *   - Get the remote keys.
  *
- * -------- noise_alloc --------
+ * -------- noise_upcall --------
  *
- * The noise_alloc struct is used to lookup incoming public keys, as well as
+ * The noise_upcall struct is used to lookup incoming public keys, as well as
  * allocate and deallocate index for a remote. The allocation and deallocation
  * are serialised per noise_remote and guaranteed to only have 3 allocated
  * indexes at once.
  *
- * a_arg	- passed to callback functions as void *
- * a_get_remote	- lookup noise_remote based on public key.
- * a_set_index	- allocate index for noise_remote. any further packets that
+ * u_arg	- passed to callback functions as void *
+ * u_get_remote	- lookup noise_remote based on public key.
+ * u_set_index	- allocate index for noise_remote. any further packets that
  * 		  arrive with this index should be passed to noise_* functions
  * 		  with the corresponding noise_remote.
- * a_drop_index	- dealloate index passed to callback.
+ * u_drop_index	- dealloate index passed to callback.
  *
  * -------- crypto --------
  *
@@ -88,7 +88,8 @@
  * int noise_consume_response(noise_remote *, noise_response *)
  *
  * int noise_remote_promote(noise_remote *)
- * int noise_remote_clear(noise_remote *)
+ * void noise_remote_clear(noise_remote *)
+ * void noise_remote_expire_current(noise_remote *)
  * int noise_remote_encrypt(noise_remote *, noise_data *, size_t)
  * int noise_remote_decrypt(noise_remote *, noise_data *, size_t)
  *
@@ -164,50 +165,49 @@ enum noise_state_kp {
 };
 
 struct noise_keypair {
-	LIST_ENTRY(noise_keypair)	 k_entry;
-	enum noise_state_kp	 kp_state;
-	uint32_t		 kp_local_index;
-	uint32_t		 kp_remote_index;
-	uint8_t			 kp_send[NOISE_SYMMETRIC_SIZE];
-	uint8_t			 kp_recv[NOISE_SYMMETRIC_SIZE];
-	struct timespec		 kp_birthdate; /* nanouptime */
-	struct noise_counter	 kp_ctr;
+	SLIST_ENTRY(noise_keypair)	kp_entry;
+	int				kp_valid;
+	int				kp_is_initiator;
+	uint32_t			kp_local_index;
+	uint32_t			kp_remote_index;
+	uint8_t				kp_send[NOISE_SYMMETRIC_SIZE];
+	uint8_t				kp_recv[NOISE_SYMMETRIC_SIZE];
+	struct timespec			kp_birthdate; /* nanouptime */
+	struct noise_counter		kp_ctr;
 };
 
 struct noise_remote {
-	uint8_t			 r_public[NOISE_KEY_SIZE];
-	struct noise_local	*r_local;
+	uint8_t				 r_public[NOISE_KEY_SIZE];
+	struct noise_local		*r_local;
+	uint8_t		 		 r_ss[NOISE_KEY_SIZE];
 
-	struct rwlock		 r_psk_lock;
-	uint8_t			 r_psk[NOISE_PSK_SIZE];
+	struct rwlock			 r_handshake_lock;
+	struct noise_handshake		 r_handshake;
+	uint8_t				 r_psk[NOISE_PSK_SIZE];
+	uint8_t				 r_timestamp[NOISE_TIMESTAMP_SIZE];
+	struct timespec			 r_last_init; /* nanouptime */
 
-	struct rwlock		 r_handshake_lock;
-	struct noise_handshake	 r_handshake;
-	uint8_t			 r_timestamp[NOISE_TIMESTAMP_SIZE];
-	struct timespec		 r_last_init; /* nanouptime */
-	/* precomputed */
-	uint8_t		 	 r_ss[NOISE_KEY_SIZE];
-
-	struct rwlock		 r_keypair_lock;
-	struct noise_keypair	*r_next, *r_current, *r_previous;
-	struct noise_keypair	 r_keypair[3]; /* 3: next, current, previous. */
+	struct rwlock			 r_keypair_lock;
+	SLIST_HEAD(,noise_keypair)	 r_unused_keypairs;
+	struct noise_keypair		*r_next, *r_current, *r_previous;
+	struct noise_keypair		 r_keypair[3]; /* 3: next, current, previous. */
 
 };
 
 struct noise_local {
-	struct rwlock		l_lock;
+	struct rwlock		l_identity_lock;
 	int			l_has_identity;
 	uint8_t			l_public[NOISE_KEY_SIZE];
 	uint8_t			l_private[NOISE_KEY_SIZE];
 
-	struct noise_alloc {
-		void	 *a_arg;
+	struct noise_upcall {
+		void	 *u_arg;
 		struct noise_remote *
-			(*a_remote_get)(void *, uint8_t[NOISE_KEY_SIZE]);
+			(*u_remote_get)(void *, uint8_t[NOISE_KEY_SIZE]);
 		uint32_t
-			(*a_index_set)(void *, struct noise_remote *);
-		void	(*a_index_drop)(void *, uint32_t);
-	}			l_alloc;
+			(*u_index_set)(void *, struct noise_remote *);
+		void	(*u_index_drop)(void *, uint32_t);
+	}			l_upcall;
 };
 
 struct noise_initiation {
@@ -232,7 +232,9 @@ struct noise_data {
 
 
 /* Set/Get noise parameters */
-void	noise_local_init(struct noise_local *, struct noise_alloc *);
+void	noise_local_init(struct noise_local *, struct noise_upcall *);
+void	noise_local_lock_identity(struct noise_local *);
+void	noise_local_unlock_identity(struct noise_local *);
 int	noise_local_set_private(struct noise_local *, uint8_t[NOISE_KEY_SIZE]);
 int	noise_local_keys(struct noise_local *, uint8_t[NOISE_KEY_SIZE],
 	    uint8_t[NOISE_KEY_SIZE]);
@@ -264,8 +266,9 @@ int	noise_consume_response(
 	    struct noise_remote *,
 	    struct noise_response *);
 
-int	noise_remote_promote(struct noise_remote *);
-int	noise_remote_clear(struct noise_remote *);
+ int	noise_remote_begin_session(struct noise_remote *);
+void	noise_remote_clear(struct noise_remote *);
+void	noise_remote_expire_current(struct noise_remote *);
 
 int	noise_remote_ready(struct noise_remote *);
 

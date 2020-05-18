@@ -109,7 +109,6 @@ struct wg_endpoint {
 
 struct wg_socket {
 	struct mtx	 so_mtx;
-	uint8_t		 so_rdomain;
 	in_port_t	 so_port;
 	struct socket	*so_so4;
 	struct socket	*so_so6;
@@ -322,4 +321,8 @@ void wg_softc_handshake_receive(struct wg_softc *sc);
 
 void wg_cookie_checker_precompute_device_keys(struct wg_softc *sc);
 
+struct noise_remote *wg_remote_get(struct wg_softc *, uint8_t [NOISE_KEY_SIZE]);
+uint32_t wg_index_set(struct wg_softc *, struct noise_remote *);
+struct noise_remote *wg_index_get(struct wg_softc *, uint32_t);
+void wg_index_drop(struct wg_softc *, uint32_t);
 #endif /* _IF_WG_VARS_H_ */

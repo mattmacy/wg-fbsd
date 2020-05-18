@@ -27,18 +27,13 @@
 #include <zinc/chacha20poly1305.h>
 
 /* Private functions */
-static void	noise_remote_get_precomputed(
-			struct noise_remote *r, uint8_t ss[NOISE_KEY_SIZE]);
-static void	noise_remote_get_handshake(
-			struct noise_remote *, struct noise_handshake *);
-static int	noise_remote_set_handshake(
-			struct noise_remote *, struct noise_handshake *,
-			uint32_t *, uint32_t *, uint8_t[NOISE_TIMESTAMP_SIZE]);
-static void	noise_keypair_slide(
-			struct noise_keypair **,
-			struct noise_keypair **,
-			struct noise_keypair *,
-			struct noise_alloc *);
+static struct noise_keypair *
+		noise_remote_keypair_allocate(struct noise_remote *);
+static void
+		noise_remote_keypair_free(struct noise_remote *,
+			struct noise_keypair *);
+static uint32_t	noise_remote_handshake_index_get(struct noise_remote *);
+static void	noise_remote_handshake_index_drop(struct noise_remote *);
 
 static uint64_t	noise_counter_send(struct noise_counter *);
 static int	noise_counter_recv(struct noise_counter *, uint64_t);
@@ -48,12 +43,12 @@ static void	noise_kdf(uint8_t *, uint8_t *, uint8_t *, const uint8_t *,
 			const uint8_t [NOISE_HASH_SIZE]);
 static int	noise_mix_dh(
 			uint8_t [NOISE_HASH_SIZE],
-			uint8_t [NOISE_KEY_SIZE],
+			uint8_t [NOISE_SYMMETRIC_SIZE],
 			const uint8_t [NOISE_KEY_SIZE],
 			const uint8_t [NOISE_KEY_SIZE]);
 static int	noise_mix_ss(
 			uint8_t ck[NOISE_HASH_SIZE],
-			uint8_t key[NOISE_KEY_SIZE],
+			uint8_t key[NOISE_SYMMETRIC_SIZE],
 			const uint8_t ss[NOISE_KEY_SIZE]);
 static void	noise_mix_hash(
 			uint8_t [NOISE_HASH_SIZE],
@@ -62,7 +57,7 @@ static void	noise_mix_hash(
 static void	noise_mix_psk(
 			uint8_t [NOISE_HASH_SIZE],
 			uint8_t [NOISE_HASH_SIZE],
-			uint8_t [NOISE_KEY_SIZE],
+			uint8_t [NOISE_SYMMETRIC_SIZE],
 			const uint8_t [NOISE_KEY_SIZE]);
 static void	noise_param_init(
 			uint8_t [NOISE_HASH_SIZE],
@@ -70,9 +65,11 @@ static void	noise_param_init(
 			const uint8_t [NOISE_KEY_SIZE]);
 
 static void	noise_msg_encrypt(uint8_t *, const uint8_t *, size_t,
-			uint8_t [NOISE_KEY_SIZE], uint8_t [NOISE_HASH_SIZE]);
+			uint8_t [NOISE_SYMMETRIC_SIZE],
+			uint8_t [NOISE_HASH_SIZE]);
 static int	noise_msg_decrypt(uint8_t *, const uint8_t *, size_t,
-			uint8_t [NOISE_KEY_SIZE], uint8_t [NOISE_HASH_SIZE]);
+			uint8_t [NOISE_SYMMETRIC_SIZE],
+			uint8_t [NOISE_HASH_SIZE]);
 static void	noise_msg_ephemeral(
 			uint8_t [NOISE_HASH_SIZE],
 			uint8_t [NOISE_HASH_SIZE],
@@ -81,28 +78,36 @@ static void	noise_msg_ephemeral(
 static void	noise_tai64n_now(uint8_t [NOISE_TIMESTAMP_SIZE]);
 static int	noise_timer_expired(struct timespec *, time_t, long);
 
-static uint8_t	null_psk[NOISE_PSK_SIZE];
-
 /* Set/Get noise parameters */
 void
-noise_local_init(struct noise_local *l, struct noise_alloc *a)
+noise_local_init(struct noise_local *l, struct noise_upcall *upcall)
 {
 	bzero(l, sizeof(*l));
-	rw_init(&l->l_lock, "noise_local");
-	l->l_alloc = *a;
+	rw_init(&l->l_identity_lock, "noise_local_identity");
+	l->l_upcall = *upcall;
+}
+
+void
+noise_local_lock_identity(struct noise_local *l)
+{
+	rw_enter_write(&l->l_identity_lock);
+}
+
+void
+noise_local_unlock_identity(struct noise_local *l)
+{
+	rw_exit_write(&l->l_identity_lock);
 }
 
 int
 noise_local_set_private(struct noise_local *l, uint8_t private[NOISE_KEY_SIZE])
 {
-	int ret;
-	rw_enter_write(&l->l_lock);
+
 	memcpy(l->l_private, private, NOISE_KEY_SIZE);
 	curve25519_clamp_secret(l->l_private);
 	l->l_has_identity = curve25519_generate_public(l->l_public, private);
-	ret = l->l_has_identity ? 0 : ENXIO;
-	rw_exit_write(&l->l_lock);
-	return ret;
+
+	return l->l_has_identity ? 0 : ENXIO;
 }
 
 int
@@ -110,7 +115,7 @@ noise_local_keys(struct noise_local *l, uint8_t public[NOISE_KEY_SIZE],
     uint8_t private[NOISE_KEY_SIZE])
 {
 	int ret = 0;
-	rw_enter_read(&l->l_lock);
+	rw_enter_read(&l->l_identity_lock);
 	if (l->l_has_identity) {
 		if (public != NULL)
 			memcpy(public, l->l_public, NOISE_KEY_SIZE);
@@ -119,39 +124,41 @@ noise_local_keys(struct noise_local *l, uint8_t public[NOISE_KEY_SIZE],
 	} else {
 		ret = ENXIO;
 	}
-	rw_exit_read(&l->l_lock);
+	rw_exit_read(&l->l_identity_lock);
 	return ret;
 }
 
 void
 noise_remote_init(struct noise_remote *r, uint8_t public[NOISE_KEY_SIZE],
-    struct noise_local *local)
+    struct noise_local *l)
 {
 	bzero(r, sizeof(*r));
 	memcpy(r->r_public, public, NOISE_KEY_SIZE);
-	rw_init(&r->r_psk_lock, "noise_psk");
 	rw_init(&r->r_handshake_lock, "noise_handshake");
 	rw_init(&r->r_keypair_lock, "noise_keypair");
 
-	r->r_next = &r->r_keypair[0];
-	r->r_current = &r->r_keypair[1];
-	r->r_previous = &r->r_keypair[2];
+	SLIST_INSERT_HEAD(&r->r_unused_keypairs, &r->r_keypair[0], kp_entry);
+	SLIST_INSERT_HEAD(&r->r_unused_keypairs, &r->r_keypair[1], kp_entry);
+	SLIST_INSERT_HEAD(&r->r_unused_keypairs, &r->r_keypair[2], kp_entry);
 
-	ASSERT(local != NULL);
-	r->r_local = local;
+	ASSERT(l != NULL);
+	r->r_local = l;
+
+	rw_enter_write(&l->l_identity_lock);
 	noise_remote_precompute(r);
+	rw_exit_write(&l->l_identity_lock);
 }
 
 int
-noise_remote_set_psk(struct noise_remote *r, uint8_t key[NOISE_PSK_SIZE])
+noise_remote_set_psk(struct noise_remote *r, uint8_t psk[NOISE_PSK_SIZE])
 {
 	int same;
-	rw_enter_write(&r->r_psk_lock);
-	same = !timingsafe_bcmp(r->r_psk, key, NOISE_KEY_SIZE);
+	rw_enter_write(&r->r_handshake_lock);
+	same = !timingsafe_bcmp(r->r_psk, psk, NOISE_PSK_SIZE);
 	if (!same) {
-		memcpy(r->r_psk, key, NOISE_PSK_SIZE);
+		memcpy(r->r_psk, psk, NOISE_PSK_SIZE);
 	}
-	rw_exit_write(&r->r_psk_lock);
+	rw_exit_write(&r->r_handshake_lock);
 	return same ? EEXIST : 0;
 }
 
@@ -159,16 +166,17 @@ int
 noise_remote_keys(struct noise_remote *r, uint8_t public[NOISE_KEY_SIZE],
     uint8_t psk[NOISE_PSK_SIZE])
 {
+	static uint8_t null_psk[NOISE_PSK_SIZE];
 	int ret;
 
 	if (public != NULL)
 		memcpy(public, r->r_public, NOISE_KEY_SIZE);
 
-	rw_enter_read(&r->r_psk_lock);
+	rw_enter_read(&r->r_handshake_lock);
 	if (psk != NULL)
 		memcpy(psk, r->r_psk, NOISE_PSK_SIZE);
 	ret = timingsafe_bcmp(r->r_psk, null_psk, NOISE_PSK_SIZE);
-	rw_exit_read(&r->r_psk_lock);
+	rw_exit_read(&r->r_handshake_lock);
 
 	/* If r_psk != null_psk return 0, else ENOENT (no psk) */
 	return ret ? 0 : ENOENT;
@@ -178,13 +186,14 @@ void
 noise_remote_precompute(struct noise_remote *r)
 {
 	struct noise_local *l = r->r_local;
-	rw_enter_write(&r->r_handshake_lock);
-	rw_enter_read(&l->l_lock);
 	if (!l->l_has_identity)
 		bzero(r->r_ss, NOISE_KEY_SIZE);
 	else if (!curve25519(r->r_ss, l->l_private, r->r_public))
 		bzero(r->r_ss, NOISE_KEY_SIZE);
-	rw_exit_read(&l->l_lock);
+
+	rw_enter_write(&r->r_handshake_lock);
+	noise_remote_handshake_index_drop(r);
+	explicit_bzero(&r->r_handshake, sizeof(r->r_handshake));
 	rw_exit_write(&r->r_handshake_lock);
 }
 
@@ -192,50 +201,51 @@ noise_remote_precompute(struct noise_remote *r)
 int
 noise_create_initiation(struct noise_remote *r, struct noise_initiation *init)
 {
-	struct noise_handshake hs;
-	uint8_t key[NOISE_KEY_SIZE];
-	uint8_t	ss[NOISE_KEY_SIZE];
-	uint8_t	rpublic[NOISE_KEY_SIZE];
-	uint8_t	lpublic[NOISE_KEY_SIZE];
-	uint8_t	lprivate[NOISE_KEY_SIZE];
+	struct noise_handshake *hs = &r->r_handshake;
+	struct noise_local *l = r->r_local;
+	uint8_t key[NOISE_SYMMETRIC_SIZE];
 	int ret = EINVAL;
 
-	if (noise_local_keys(r->r_local, lpublic, lprivate) != 0)
+	rw_enter_read(&l->l_identity_lock);
+	rw_enter_write(&r->r_handshake_lock);
+	if (!l->l_has_identity)
 		goto error;
-	noise_remote_keys(r, rpublic, NULL);
-	noise_param_init(hs.hs_ck, hs.hs_hash, rpublic);
+	noise_param_init(hs->hs_ck, hs->hs_hash, r->r_public);
 
 	/* e */
-	curve25519_generate_secret(hs.hs_e);
-	if (curve25519_generate_public(init->ue, hs.hs_e) == 0)
+	curve25519_generate_secret(hs->hs_e);
+	if (curve25519_generate_public(init->ue, hs->hs_e) == 0)
 		goto error;
-	noise_msg_ephemeral(hs.hs_ck, hs.hs_hash, init->ue);
+	noise_msg_ephemeral(hs->hs_ck, hs->hs_hash, init->ue);
 
 	/* es */
-	if (noise_mix_dh(hs.hs_ck, key, hs.hs_e, rpublic) != 0)
+	if (noise_mix_dh(hs->hs_ck, key, hs->hs_e, r->r_public) != 0)
 		goto error;
 
 	/* s */
-	noise_msg_encrypt(init->es, lpublic, NOISE_KEY_SIZE, key, hs.hs_hash);
+	noise_msg_encrypt(init->es, l->l_public,
+	    NOISE_KEY_SIZE, key, hs->hs_hash);
 
 	/* ss */
-	noise_remote_get_precomputed(r, ss);
-	if (noise_mix_ss(hs.hs_ck, key, r->r_ss) != 0)
+	if (noise_mix_ss(hs->hs_ck, key, r->r_ss) != 0)
 		goto error;
 
 	/* {t} */
 	noise_tai64n_now(init->ets);
 	noise_msg_encrypt(init->ets, init->ets,
-	    NOISE_TIMESTAMP_SIZE, key, hs.hs_hash);
+	    NOISE_TIMESTAMP_SIZE, key, hs->hs_hash);
 
-	hs.hs_state = CREATED_INITIATION;
-	ret = noise_remote_set_handshake(r, &hs, &init->s_idx, NULL, NULL);
+	noise_remote_handshake_index_drop(r);
+	hs->hs_state = CREATED_INITIATION;
+	hs->hs_local_index = noise_remote_handshake_index_get(r);
+	init->s_idx = hs->hs_local_index;
+	ret = 0;
 error:
+	rw_exit_write(&r->r_handshake_lock);
+	rw_exit_read(&l->l_identity_lock);
 	if (ret != 0)
 		explicit_bzero(init, sizeof(*init));
-	explicit_bzero(lprivate, NOISE_KEY_SIZE);
-	explicit_bzero(key, NOISE_KEY_SIZE);
-	explicit_bzero(ss, NOISE_KEY_SIZE);
+	explicit_bzero(key, NOISE_SYMMETRIC_SIZE);
 	return ret;
 }
 
@@ -245,38 +255,34 @@ noise_consume_initiation(struct noise_local *l, struct noise_remote **rp,
 {
 	struct noise_remote *r;
 	struct noise_handshake hs;
-	uint8_t	ss[NOISE_KEY_SIZE];
-	uint8_t key[NOISE_KEY_SIZE];
-	uint8_t	rpublic[NOISE_KEY_SIZE];
-	uint8_t	lpublic[NOISE_KEY_SIZE];
-	uint8_t	lprivate[NOISE_KEY_SIZE];
+	uint8_t key[NOISE_SYMMETRIC_SIZE];
+	uint8_t r_public[NOISE_KEY_SIZE];
 	uint8_t	timestamp[NOISE_TIMESTAMP_SIZE];
 	int ret = EINVAL;
 
-	if (noise_local_keys(l, lpublic, lprivate) != 0)
+	rw_enter_read(&l->l_identity_lock);
+	if (!l->l_has_identity)
 		goto error;
-	noise_param_init(hs.hs_ck, hs.hs_hash, lpublic);
+	noise_param_init(hs.hs_ck, hs.hs_hash, l->l_public);
 
 	/* e */
-	memcpy(hs.hs_e, init->ue, NOISE_KEY_SIZE);
 	noise_msg_ephemeral(hs.hs_ck, hs.hs_hash, init->ue);
 
 	/* es */
-	if (noise_mix_dh(hs.hs_ck, key, lprivate, init->ue) != 0)
+	if (noise_mix_dh(hs.hs_ck, key, l->l_private, init->ue) != 0)
 		goto error;
 
 	/* s */
-	if (noise_msg_decrypt(rpublic, init->es,
+	if (noise_msg_decrypt(r_public, init->es,
 	    NOISE_KEY_SIZE + NOISE_MAC_SIZE, key, hs.hs_hash) != 0)
 		goto error;
 
-	/* lookup the remote we received from */
-	if ((r = l->l_alloc.a_remote_get(l->l_alloc.a_arg, rpublic)) == NULL)
+	/* Lookup the remote we received from */
+	if ((r = l->l_upcall.u_remote_get(l->l_upcall.u_arg, r_public)) == NULL)
 		goto error;
 
 	/* ss */
-	noise_remote_get_precomputed(r, ss);
-	if (noise_mix_ss(hs.hs_ck, key, ss) != 0)
+	if (noise_mix_ss(hs.hs_ck, key, r->r_ss) != 0)
 		goto error;
 
 	/* {t} */
@@ -285,60 +291,84 @@ noise_consume_initiation(struct noise_local *l, struct noise_remote **rp,
 		goto error;
 
 	hs.hs_state = CONSUMED_INITIATION;
-	ret = noise_remote_set_handshake(r, &hs, NULL, &init->s_idx, timestamp);
+	hs.hs_local_index = 0;
+	hs.hs_remote_index = init->s_idx;
+	memcpy(hs.hs_e, init->ue, NOISE_KEY_SIZE);
 
-	if (ret == 0)
-		*rp = r;
+	/* We have successfully computed the same results, now we ensure that
+	 * this is not an initiation replay, or a flood attack */
+	rw_enter_write(&r->r_handshake_lock);
+
+	/* Replay */
+	if (memcmp(timestamp, r->r_timestamp, NOISE_TIMESTAMP_SIZE) > 0)
+		memcpy(r->r_timestamp, timestamp, NOISE_TIMESTAMP_SIZE);
+	else
+		goto error_set;
+	/* Flood attack */
+	if (noise_timer_expired(&r->r_last_init, 0, REJECT_INTERVAL))
+		getnanouptime(&r->r_last_init);
+	else
+		goto error_set;
+
+	/* Ok, we're happy to accept this initiation now */
+	noise_remote_handshake_index_drop(r);
+	r->r_handshake = hs;
+	*rp = r;
+	ret = 0;
+error_set:
+	rw_exit_write(&r->r_handshake_lock);
 error:
-	explicit_bzero(lprivate, NOISE_KEY_SIZE);
-	explicit_bzero(key, NOISE_KEY_SIZE);
-	explicit_bzero(ss, NOISE_KEY_SIZE);
+	rw_exit_read(&l->l_identity_lock);
+	explicit_bzero(key, NOISE_SYMMETRIC_SIZE);
+	explicit_bzero(&hs, sizeof(hs));
 	return ret;
 }
 
 int
 noise_create_response(struct noise_remote *r, struct noise_response *resp)
 {
-	struct noise_handshake hs;
+	struct noise_handshake *hs = &r->r_handshake;
+	uint8_t key[NOISE_SYMMETRIC_SIZE];
 	uint8_t e[NOISE_KEY_SIZE];
-	uint8_t key[NOISE_KEY_SIZE];
-	uint8_t rpsk[NOISE_PSK_SIZE];
-	uint8_t rpublic[NOISE_KEY_SIZE];
 	int ret = EINVAL;
 
-	noise_remote_get_handshake(r, &hs);
-	noise_remote_keys(r, rpublic, rpsk);
+	rw_enter_read(&r->r_local->l_identity_lock);
+	rw_enter_write(&r->r_handshake_lock);
 
-	if (hs.hs_state != CONSUMED_INITIATION)
+	if (hs->hs_state != CONSUMED_INITIATION)
 		goto error;
 
 	/* e */
 	curve25519_generate_secret(e);
 	if (curve25519_generate_public(resp->ue, e) == 0)
 		goto error;
-	noise_msg_ephemeral(hs.hs_ck, hs.hs_hash, resp->ue);
+	noise_msg_ephemeral(hs->hs_ck, hs->hs_hash, resp->ue);
 
 	/* ee */
-	if (noise_mix_dh(hs.hs_ck, NULL, e, hs.hs_e) != 0)
+	if (noise_mix_dh(hs->hs_ck, NULL, e, hs->hs_e) != 0)
 		goto error;
 
 	/* se */
-	if (noise_mix_dh(hs.hs_ck, NULL, e, rpublic) != 0)
+	if (noise_mix_dh(hs->hs_ck, NULL, e, r->r_public) != 0)
 		goto error;
 
 	/* psk */
-	noise_mix_psk(hs.hs_ck, hs.hs_hash, key, rpsk);
+	noise_mix_psk(hs->hs_ck, hs->hs_hash, key, r->r_psk);
 
 	/* {} */
-	noise_msg_encrypt(resp->en, NULL, 0, key, hs.hs_hash);
+	noise_msg_encrypt(resp->en, NULL, 0, key, hs->hs_hash);
 
-	hs.hs_state = CREATED_RESPONSE;
-	ret = noise_remote_set_handshake(r, &hs, &resp->s_idx, &resp->r_idx, NULL);
+	hs->hs_state = CREATED_RESPONSE;
+	hs->hs_local_index = noise_remote_handshake_index_get(r);
+	resp->r_idx = hs->hs_remote_index;
+	resp->s_idx = hs->hs_local_index;
+	ret = 0;
 error:
+	rw_exit_write(&r->r_handshake_lock);
+	rw_exit_read(&r->r_local->l_identity_lock);
 	if (ret != 0)
 		explicit_bzero(resp, sizeof(*resp));
-	explicit_bzero(rpsk, NOISE_PSK_SIZE);
-	explicit_bzero(key, NOISE_KEY_SIZE);
+	explicit_bzero(key, NOISE_SYMMETRIC_SIZE);
 	explicit_bzero(e, NOISE_KEY_SIZE);
 	return ret;
 }
@@ -346,21 +376,24 @@ error:
 int
 noise_consume_response(struct noise_remote *r, struct noise_response *resp)
 {
+	struct noise_local *l = r->r_local;
 	struct noise_handshake hs;
-	uint8_t key[NOISE_KEY_SIZE];
-	uint8_t rpsk[NOISE_PSK_SIZE];
-	uint8_t lprivate[NOISE_KEY_SIZE];
+	uint8_t key[NOISE_SYMMETRIC_SIZE];
+	uint8_t preshared_key[NOISE_KEY_SIZE];
 	int ret = EINVAL;
 
-	if (noise_local_keys(r->r_local, NULL, lprivate) != 0)
+	rw_enter_read(&l->l_identity_lock);
+	if (!l->l_has_identity)
 		goto error;
 
-	noise_remote_get_handshake(r, &hs);
-	noise_remote_keys(r, NULL, rpsk);
+	rw_enter_read(&r->r_handshake_lock);
+	hs = r->r_handshake;
+	memcpy(preshared_key, r->r_psk, NOISE_PSK_SIZE);
+	rw_exit_read(&r->r_handshake_lock);
 
-	if (hs.hs_state != CREATED_INITIATION)
+	if (hs.hs_state != CREATED_INITIATION ||
+	    hs.hs_local_index != resp->r_idx)
 		goto error;
-
 
 	/* e */
 	noise_msg_ephemeral(hs.hs_ck, hs.hs_hash, resp->ue);
@@ -370,102 +403,125 @@ noise_consume_response(struct noise_remote *r, struct noise_response *resp)
 		goto error;
 
 	/* se */
-	if (noise_mix_dh(hs.hs_ck, NULL, lprivate, resp->ue) != 0)
+	if (noise_mix_dh(hs.hs_ck, NULL, l->l_private, resp->ue) != 0)
 		goto error;
 
 	/* psk */
-	noise_mix_psk(hs.hs_ck, hs.hs_hash, key, rpsk);
+	noise_mix_psk(hs.hs_ck, hs.hs_hash, key, preshared_key);
 
 	/* {} */
 	if (noise_msg_decrypt(NULL, resp->en,
 	    0 + NOISE_MAC_SIZE, key, hs.hs_hash) != 0)
 		goto error;
 
-	hs.hs_state = CONSUMED_RESPONSE;
-	ret = noise_remote_set_handshake(r, &hs, &resp->r_idx, &resp->s_idx, NULL);
+	hs.hs_remote_index = resp->s_idx;
+
+	rw_enter_write(&r->r_handshake_lock);
+	if (r->r_handshake.hs_state == hs.hs_state &&
+	    r->r_handshake.hs_local_index == hs.hs_local_index) {
+		r->r_handshake = hs;
+		r->r_handshake.hs_state = CONSUMED_RESPONSE;
+		ret = 0;
+	}
+	rw_exit_write(&r->r_handshake_lock);
 error:
-	explicit_bzero(lprivate, NOISE_KEY_SIZE);
-	explicit_bzero(key, NOISE_KEY_SIZE);
+	rw_exit_read(&l->l_identity_lock);
+	explicit_bzero(&hs, sizeof(hs));
+	explicit_bzero(key, NOISE_SYMMETRIC_SIZE);
 	return ret;
 }
 
 int
-noise_remote_promote(struct noise_remote *r)
+noise_remote_begin_session(struct noise_remote *r)
 {
 	struct noise_handshake *hs = &r->r_handshake;
-	struct noise_alloc *a = &r->r_local->l_alloc;
-	struct noise_keypair kp;
+	struct noise_keypair kp, *next, *current, *previous;
 
-	/* We can read kp_state and kp_local_id because they can only change
-	 * within this r_handshake_lock. */
 	rw_enter_write(&r->r_handshake_lock);
 
+	/* We now derive the keypair from the handshake */
+	if (hs->hs_state == CONSUMED_RESPONSE) {
+		kp.kp_is_initiator = 1;
+		noise_kdf(kp.kp_send, kp.kp_recv, NULL, NULL,
+		    NOISE_SYMMETRIC_SIZE, NOISE_SYMMETRIC_SIZE, 0, 0,
+		    hs->hs_ck);
+	} else if (hs->hs_state == CREATED_RESPONSE) {
+		kp.kp_is_initiator = 0;
+		noise_kdf(kp.kp_recv, kp.kp_send, NULL, NULL,
+		    NOISE_SYMMETRIC_SIZE, NOISE_SYMMETRIC_SIZE, 0, 0,
+		    hs->hs_ck);
+	} else {
+		rw_exit_write(&r->r_keypair_lock);
+		return EINVAL;
+	}
+
+	kp.kp_valid = 1;
 	kp.kp_local_index = hs->hs_local_index;
 	kp.kp_remote_index = hs->hs_remote_index;
 	getnanouptime(&kp.kp_birthdate);
 	bzero(&kp.kp_ctr, sizeof(kp.kp_ctr));
 	rw_init(&kp.kp_ctr.c_lock, "noise_counter");
 
-	if (hs->hs_state == CONSUMED_RESPONSE) {
+	/* Now we need to add_new_keypair */
+	rw_enter_write(&r->r_keypair_lock);
+	next = r->r_next;
+	current = r->r_current;
+	previous = r->r_previous;
 
-		kp.kp_state = INITIATOR;
-		noise_kdf(kp.kp_send, kp.kp_recv, NULL, NULL,
-		    NOISE_KEY_SIZE, NOISE_KEY_SIZE, 0, 0, hs->hs_ck);
-
-		rw_enter_write(&r->r_keypair_lock);
-
-		if (r->r_next->kp_state == KP_ZEROED) {
-			noise_keypair_slide(&r->r_previous, &r->r_current, &kp, a);
+	if (kp.kp_is_initiator) {
+		if (next != NULL) {
+			r->r_next = NULL;
+			r->r_previous = next;
+			noise_remote_keypair_free(r, current);
 		} else {
-			noise_keypair_slide(&r->r_previous, &r->r_next, NULL, a);
-			noise_keypair_slide(&r->r_current, NULL, &kp, a);
+			r->r_previous = current;
 		}
 
-	} else if (hs->hs_state == CREATED_RESPONSE) {
+		noise_remote_keypair_free(r, previous);
 
-		kp.kp_state = RESPONDER;
-		noise_kdf(kp.kp_recv, kp.kp_send, NULL, NULL,
-		    NOISE_KEY_SIZE, NOISE_KEY_SIZE, 0, 0, hs->hs_ck);
-
-		rw_enter_write(&r->r_keypair_lock);
-
-		noise_keypair_slide(&r->r_next, NULL, &kp, a);
-		noise_keypair_slide(&r->r_previous, NULL, NULL, a);
-
+		r->r_current = noise_remote_keypair_allocate(r);
+		*r->r_current = kp;
 	} else {
-		/* We could zero out the handshake here, but we would also need
-		 * to drop the hs_local_index if we did. Currently we do not
-		 * zero the handshake for robustness. */
-		rw_exit_write(&r->r_handshake_lock);
-		return EINVAL;
-	}
+		noise_remote_keypair_free(r, next);
+		r->r_previous = NULL;
+		noise_remote_keypair_free(r, previous);
 
+		r->r_next = noise_remote_keypair_allocate(r);
+		*r->r_next = kp;
+	}
 	rw_exit_write(&r->r_keypair_lock);
 
 	explicit_bzero(&r->r_handshake, sizeof(r->r_handshake));
-	explicit_bzero(&kp, sizeof(kp));
-
 	rw_exit_write(&r->r_handshake_lock);
+
+	explicit_bzero(&kp, sizeof(kp));
 	return 0;
 }
 
-int
+void
 noise_remote_clear(struct noise_remote *r)
 {
-	struct noise_alloc *a = &r->r_local->l_alloc;
-
 	rw_enter_write(&r->r_handshake_lock);
-	if (r->r_handshake.hs_state != HS_ZEROED)
-		a->a_index_drop(a->a_arg, r->r_handshake.hs_local_index);
+	noise_remote_handshake_index_drop(r);
 	explicit_bzero(&r->r_handshake, sizeof(r->r_handshake));
 	rw_exit_write(&r->r_handshake_lock);
 
 	rw_enter_write(&r->r_keypair_lock);
-	noise_keypair_slide(&r->r_next, NULL, NULL, a);
-	noise_keypair_slide(&r->r_current, NULL, NULL, a);
-	noise_keypair_slide(&r->r_previous, NULL, NULL, a);
+	noise_remote_keypair_free(r, r->r_next);
+	noise_remote_keypair_free(r, r->r_current);
+	noise_remote_keypair_free(r, r->r_previous);
 	rw_exit_write(&r->r_keypair_lock);
-	return 0;
+}
+
+void
+noise_remote_expire_current(struct noise_remote *r)
+{
+	rw_enter_write(&r->r_keypair_lock);
+	if (r->r_next != NULL)
+		r->r_next->kp_valid = 0;
+	if (r->r_current != NULL)
+		r->r_current->kp_valid = 0;
+	rw_exit_write(&r->r_keypair_lock);
 }
 
 int
@@ -475,9 +531,9 @@ noise_remote_ready(struct noise_remote *r)
 	int ret;
 
 	rw_enter_read(&r->r_keypair_lock);
-	kp = r->r_current;
 	/* kp_ctr isn't locked here, we're happy to accept a racy read. */
-	if (kp->kp_state == KP_ZEROED ||
+	if ((kp = r->r_current) == NULL ||
+	    !kp->kp_valid ||
 	    noise_timer_expired(&kp->kp_birthdate, REJECT_AFTER_TIME, 0) ||
 	    kp->kp_ctr.c_recv >= REJECT_AFTER_MESSAGES ||
 	    kp->kp_ctr.c_send >= REJECT_AFTER_MESSAGES)
@@ -497,16 +553,17 @@ noise_remote_encrypt(struct noise_remote *r, struct noise_data *data,
 	int ret = EINVAL;
 
 	rw_enter_read(&r->r_keypair_lock);
-	kp = r->r_current;
+	if ((kp = r->r_current) == NULL)
+		goto error;
 
 	/* We confirm that our values are within our tolerances. We want:
-	 *  - a non-zero keypair
+	 *  - a valid keypair
 	 *  - our keypair to be less than REJECT_AFTER_TIME seconds old
 	 *  - our receive counter to be less than REJECT_AFTER_MESSAGES
 	 *  - our send counter to be less than REJECT_AFTER_MESSAGES
 	 *
 	 * kp_ctr isn't locked here, we're happy to accept a racy read. */
-	if (kp->kp_state == KP_ZEROED ||
+	if (!kp->kp_valid ||
 	    noise_timer_expired(&kp->kp_birthdate, REJECT_AFTER_TIME, 0) ||
 	    kp->kp_ctr.c_recv >= REJECT_AFTER_MESSAGES ||
 	    ((ctr = noise_counter_send(&kp->kp_ctr)) > REJECT_AFTER_MESSAGES))
@@ -532,7 +589,7 @@ noise_remote_encrypt(struct noise_remote *r, struct noise_data *data,
 	ret = ESTALE;
 	if (ctr >= REKEY_AFTER_MESSAGES)
 		goto error;
-	if (kp->kp_state == INITIATOR &&
+	if (kp->kp_is_initiator &&
 	    noise_timer_expired(&kp->kp_birthdate, REKEY_AFTER_TIME, 0))
 		goto error;
 
@@ -556,21 +613,21 @@ noise_remote_decrypt(struct noise_remote *r, struct noise_data *data,
 	 * catastrophic to decrypt against a zero'ed keypair. */
 	rw_enter_read(&r->r_keypair_lock);
 
-	if (r->r_current->kp_local_index == data->r_idx)
-		kp = r->r_current;
-	else if (r->r_previous->kp_local_index == data->r_idx)
-		kp = r->r_previous;
-	else if (r->r_next->kp_local_index == data->r_idx)
-		kp = r->r_next;
-	else
+	if (r->r_current != NULL && r->r_current->kp_local_index == data->r_idx) {
+			kp = r->r_current;
+	} else if (r->r_previous != NULL && r->r_previous->kp_local_index == data->r_idx) {
+			kp = r->r_previous;
+	} else if (r->r_next != NULL && r->r_next->kp_local_index == data->r_idx) {
+			kp = r->r_next;
+	} else {
 		goto error;
+	}
 
 	/* We confirm that our values are within our tolerances. These values
 	 * are the same as the encrypt routine.
 	 *
 	 * kp_ctr isn't locked here, we're happy to accept a racy read. */
-	if (kp->kp_state == KP_ZEROED ||
-	    noise_timer_expired(&kp->kp_birthdate, REJECT_AFTER_TIME, 0) ||
+	if (noise_timer_expired(&kp->kp_birthdate, REJECT_AFTER_TIME, 0) ||
 	    kp->kp_ctr.c_send >= REJECT_AFTER_MESSAGES ||
 	    kp->kp_ctr.c_recv >= REJECT_AFTER_MESSAGES)
 		goto error;
@@ -595,13 +652,12 @@ noise_remote_decrypt(struct noise_remote *r, struct noise_data *data,
 	if (kp == r->r_next) {
 		rw_exit_read(&r->r_keypair_lock);
 		rw_enter_write(&r->r_keypair_lock);
-		if (kp == r->r_next &&
-		    kp->kp_state != KP_ZEROED &&
-		    kp->kp_local_index == data->r_idx) {
-			noise_keypair_slide(&r->r_previous, &r->r_current,
-			    NULL, &r->r_local->l_alloc);
-			noise_keypair_slide(&r->r_current, &r->r_next,
-			    NULL, &r->r_local->l_alloc);
+		if (kp == r->r_next && kp->kp_local_index == data->r_idx) {
+			noise_remote_keypair_free(r, r->r_previous);
+			r->r_previous = r->r_current;
+			r->r_current = r->r_next;
+			r->r_next = NULL;
+
 			ret = ECONNRESET;
 			goto error;
 		}
@@ -614,7 +670,7 @@ noise_remote_decrypt(struct noise_remote *r, struct noise_data *data,
 	 *    REKEY_AFTER_TIME_RECV seconds. */
 	ret = ESTALE;
 	kp = r->r_current;
-	if (kp->kp_state == INITIATOR &&
+	if (kp->kp_is_initiator &&
 	    noise_timer_expired(&kp->kp_birthdate, REKEY_AFTER_TIME_RECV, 0))
 		goto error;
 
@@ -627,119 +683,43 @@ error:
 
 /* Private functions - these should not be called outside this file under any
  * circumstances. */
-static void
-noise_remote_get_precomputed(struct noise_remote *r,
-    uint8_t ss[NOISE_KEY_SIZE])
+static struct noise_keypair *
+noise_remote_keypair_allocate(struct noise_remote *r)
 {
-	rw_enter_read(&r->r_handshake_lock);
-	memcpy(ss, r->r_ss, NOISE_KEY_SIZE);
-	rw_exit_read(&r->r_handshake_lock);
-
+	struct noise_keypair *kp;
+	kp = SLIST_FIRST(&r->r_unused_keypairs);
+	SLIST_REMOVE_HEAD(&r->r_unused_keypairs, kp_entry);
+	return kp;
 }
 
 static void
-noise_remote_get_handshake(struct noise_remote *r, struct noise_handshake *hs)
+noise_remote_keypair_free(struct noise_remote *r, struct noise_keypair *kp)
 {
-	rw_enter_read(&r->r_handshake_lock);
-	*hs = r->r_handshake;
-	rw_exit_read(&r->r_handshake_lock);
-}
-
-static int
-noise_remote_set_handshake(struct noise_remote *r, struct noise_handshake *hs,
-    uint32_t *local_index, uint32_t *remote_index,
-    uint8_t timestamp[NOISE_TIMESTAMP_SIZE])
-{
-	struct noise_alloc *a = &r->r_local->l_alloc;
-	enum noise_state_hs old, new;
-	int ret = EINVAL;
-
-	rw_enter_write(&r->r_handshake_lock);
-
-	/* Check states are valid */
-	old = r->r_handshake.hs_state;
-	new = hs->hs_state;
-
-	if (new == CREATED_INITIATION) {
-		if (old != HS_ZEROED)
-			a->a_index_drop(a->a_arg,
-			    r->r_handshake.hs_local_index);
-
-		ASSERT(remote_index == NULL);
-		*local_index = a->a_index_set(a->a_arg, r);
-		hs->hs_local_index = *local_index;
-	} else if (new == CONSUMED_INITIATION) {
-		/* If we've consumed an initiation, we must check the timestamp
-		 * is newer than the last one we've received to prevent a
-		 * replay of initiation packets. While we're at it, we also
-		 * ensure that we are not being flooded with initiation
-		 * packets. */
-		if (memcmp(timestamp, r->r_timestamp, NOISE_TIMESTAMP_SIZE) > 0)
-			memcpy(r->r_timestamp, timestamp, NOISE_TIMESTAMP_SIZE);
-		else
-			goto error;
-
-		/* Flood attack */
-		if (noise_timer_expired(&r->r_last_init, 0, REJECT_INTERVAL))
-			getnanouptime(&r->r_last_init);
-		else
-			goto error;
-
-		if (old != HS_ZEROED)
-			a->a_index_drop(a->a_arg,
-			    r->r_handshake.hs_local_index);
-
-		ASSERT(local_index == NULL);
-		hs->hs_remote_index = *remote_index;
-	} else if (old == CONSUMED_INITIATION && new == CREATED_RESPONSE) {
-		*remote_index = hs->hs_remote_index;
-		*local_index = a->a_index_set(a->a_arg, r);
-		hs->hs_local_index = *local_index;
-	} else if (old == CREATED_INITIATION && new == CONSUMED_RESPONSE) {
-		ASSERT(hs->hs_local_index == *local_index);
-		hs->hs_remote_index = *remote_index;
-	} else {
-		goto error;
+	struct noise_upcall *u = &r->r_local->l_upcall;
+	if (kp != NULL) {
+		SLIST_INSERT_HEAD(&r->r_unused_keypairs, kp, kp_entry);
+		u->u_index_drop(u->u_arg, kp->kp_local_index);
+		bzero(kp->kp_send, sizeof(kp->kp_send));
+		bzero(kp->kp_recv, sizeof(kp->kp_recv));
 	}
+}
 
-	r->r_handshake = *hs;
-	ret = 0;
-error:
-	rw_exit_write(&r->r_handshake_lock);
-	explicit_bzero(hs, sizeof(*hs));
-	return ret;
+static uint32_t
+noise_remote_handshake_index_get(struct noise_remote *r)
+{
+	struct noise_upcall *u = &r->r_local->l_upcall;
+	return u->u_index_set(u->u_arg, r);
 }
 
 static void
-noise_keypair_slide(struct noise_keypair **dst,
-    struct noise_keypair **src, struct noise_keypair *new,
-    struct noise_alloc *a)
+noise_remote_handshake_index_drop(struct noise_remote *r)
 {
-	struct noise_keypair *tmp;
-	if (src == NULL) {
-		if ((*dst)->kp_state != KP_ZEROED)
-			a->a_index_drop(a->a_arg, (*dst)->kp_local_index);
-		if (new == NULL)
-			explicit_bzero(*dst, sizeof(**dst));
-		else {
-			**dst = *new;
-			explicit_bzero(new, sizeof(*new));
-		}
-	} else {
-		if ((*dst)->kp_state != KP_ZEROED)
-			a->a_index_drop(a->a_arg, (*dst)->kp_local_index);
+	struct noise_handshake *hs = &r->r_handshake;
+	struct noise_upcall *u = &r->r_local->l_upcall;
 
-		tmp = *dst;
-		*dst = *src;
-		*src = tmp;
-
-		if (new == NULL)
-			explicit_bzero(*src, sizeof(**src));
-		else {
-			**src = *new;
-			explicit_bzero(new, sizeof(*new));
-		}
-	}
+	rw_assert(&r->r_handshake_lock, RA_WLOCKED);
+	if (hs->hs_state != HS_ZEROED)
+		u->u_index_drop(u->u_arg, hs->hs_local_index);
 }
 
 static uint64_t
@@ -846,7 +826,7 @@ out:
 }
 
 static int
-noise_mix_dh(uint8_t ck[NOISE_HASH_SIZE], uint8_t key[NOISE_KEY_SIZE],
+noise_mix_dh(uint8_t ck[NOISE_HASH_SIZE], uint8_t key[NOISE_SYMMETRIC_SIZE],
     const uint8_t private[NOISE_KEY_SIZE],
     const uint8_t public[NOISE_KEY_SIZE])
 {
@@ -855,19 +835,20 @@ noise_mix_dh(uint8_t ck[NOISE_HASH_SIZE], uint8_t key[NOISE_KEY_SIZE],
 	if (!curve25519(dh, private, public))
 		return EINVAL;
 	noise_kdf(ck, key, NULL, dh,
-	    NOISE_HASH_SIZE, NOISE_KEY_SIZE, 0, NOISE_KEY_SIZE, ck);
+	    NOISE_HASH_SIZE, NOISE_SYMMETRIC_SIZE, 0, NOISE_KEY_SIZE, ck);
 	explicit_bzero(dh, NOISE_KEY_SIZE);
 	return 0;
 }
 
 static int
-noise_mix_ss(uint8_t ck[NOISE_HASH_SIZE], uint8_t key[NOISE_KEY_SIZE],
+noise_mix_ss(uint8_t ck[NOISE_HASH_SIZE], uint8_t key[NOISE_SYMMETRIC_SIZE],
     const uint8_t ss[NOISE_KEY_SIZE])
 {
+	static uint8_t null_point[NOISE_KEY_SIZE];
 	if (timingsafe_bcmp(ss, null_point, NOISE_KEY_SIZE) == 0)
 		return ENOENT;
 	noise_kdf(ck, key, NULL, ss,
-	    NOISE_HASH_SIZE, NOISE_KEY_SIZE, 0, NOISE_KEY_SIZE, ck);
+	    NOISE_HASH_SIZE, NOISE_SYMMETRIC_SIZE, 0, NOISE_KEY_SIZE, ck);
 	return 0;
 }
 
@@ -885,12 +866,13 @@ noise_mix_hash(uint8_t hash[NOISE_HASH_SIZE], const uint8_t *src,
 
 static void
 noise_mix_psk(uint8_t ck[NOISE_HASH_SIZE], uint8_t hash[NOISE_HASH_SIZE],
-    uint8_t key[NOISE_KEY_SIZE], const uint8_t psk[NOISE_KEY_SIZE])
+    uint8_t key[NOISE_SYMMETRIC_SIZE], const uint8_t psk[NOISE_KEY_SIZE])
 {
 	uint8_t tmp[NOISE_HASH_SIZE];
 
 	noise_kdf(ck, tmp, key, psk,
-	    NOISE_HASH_SIZE, NOISE_HASH_SIZE, NOISE_KEY_SIZE, NOISE_KEY_SIZE, ck);
+	    NOISE_HASH_SIZE, NOISE_HASH_SIZE, NOISE_SYMMETRIC_SIZE,
+	    NOISE_PSK_SIZE, ck);
 	noise_mix_hash(hash, tmp, NOISE_HASH_SIZE);
 	explicit_bzero(tmp, NOISE_HASH_SIZE);
 }
@@ -914,20 +896,21 @@ noise_param_init(uint8_t ck[NOISE_HASH_SIZE], uint8_t hash[NOISE_HASH_SIZE],
 
 static void
 noise_msg_encrypt(uint8_t *dst, const uint8_t *src, size_t src_len,
-    uint8_t key[NOISE_KEY_SIZE], uint8_t hash[NOISE_HASH_SIZE])
+    uint8_t key[NOISE_SYMMETRIC_SIZE], uint8_t hash[NOISE_HASH_SIZE])
 {
 	/* Nonce always zero for Noise_IK */
-	chacha20poly1305_encrypt(dst, src, src_len, hash, NOISE_HASH_SIZE, 0, key);
+	chacha20poly1305_encrypt(dst, src, src_len,
+	    hash, NOISE_HASH_SIZE, 0, key);
 	noise_mix_hash(hash, dst, src_len + NOISE_MAC_SIZE);
 }
 
 static int
 noise_msg_decrypt(uint8_t *dst, const uint8_t *src, size_t src_len,
-    uint8_t key[NOISE_KEY_SIZE], uint8_t hash[NOISE_HASH_SIZE])
+    uint8_t key[NOISE_SYMMETRIC_SIZE], uint8_t hash[NOISE_HASH_SIZE])
 {
 	/* Nonce always zero for Noise_IK */
 	if (!chacha20poly1305_decrypt(dst, src, src_len,
-				      hash, NOISE_HASH_SIZE, 0, key))
+	    hash, NOISE_HASH_SIZE, 0, key))
 		return EINVAL;
 	noise_mix_hash(hash, src, src_len);
 	return 0;
