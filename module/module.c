@@ -147,8 +147,8 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	sc->sc_ifp = iflib_get_ifp(ctx);
 
 	mbufq_init(&sc->sc_handshake_queue, MAX_QUEUED_INCOMING_HANDSHAKES);
-	wg_pktq_init(&sc->sc_encrypt_queue, "encryptq");
-	wg_pktq_init(&sc->sc_decrypt_queue, "decryptq");
+	sc->sc_encap_ring = buf_ring_alloc(MAX_QUEUED_PACKETS, M_WG, M_WAITOK, &sc->sc_mtx);
+	sc->sc_decap_ring = buf_ring_alloc(MAX_QUEUED_PACKETS, M_WG, M_WAITOK, &sc->sc_mtx);
 	GROUPTASK_INIT(&sc->sc_handshake, 0,
 	    (gtask_fn_t *)wg_softc_handshake_receive, sc);
 	taskqgroup_attach(qgroup_if_io_tqg, &sc->sc_handshake, sc, dev, NULL, "wg tx initiation");
@@ -193,14 +193,7 @@ wg_transmit(struct ifnet *ifp, struct mbuf *m)
 		/* XXX log */
 		goto err;
 	}
-	mtx_lock(&peer->p_lock);
-	if (mbufq_enqueue(&peer->p_staged_packets, m) != 0) {
-		if_inc_counter(sc->sc_ifp, IFCOUNTER_OQDROPS, 1);
-		rc = ENOBUFS;
-		m_freem(m);
-	}
-	mtx_unlock(&peer->p_lock);
-	wg_peer_send_staged_packets(peer);
+	rc = wg_queue_out(peer, m);
 	NET_EPOCH_EXIT(et);
 	return (rc); 
 err:
@@ -257,8 +250,8 @@ wg_detach(if_ctx_t ctx)
 	//sc->wg_accept_port = 0;
 	wg_socket_reinit(sc, NULL, NULL);
 	wg_peer_remove_all(sc);
-	wg_pktq_deinit(&sc->sc_encrypt_queue);
-	wg_pktq_deinit(&sc->sc_decrypt_queue);
+	buf_ring_free(sc->sc_encap_ring, M_WG);
+	buf_ring_free(sc->sc_decap_ring, M_WG);
 
 	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_handshake);
 	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_encrypt);

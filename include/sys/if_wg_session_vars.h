@@ -43,8 +43,6 @@
 #define WG_KEY_SIZE		 	32
 #define WG_HASH_SIZE			32
 #define WG_XNONCE_SIZE			24
-#define WG_MAC_SIZE		 	16
-#define WG_COOKIE_SIZE			16
 #define WG_MSG_PADDING_SIZE 		16
 #define WG_TIMESTAMP_SIZE		12
 
@@ -117,6 +115,10 @@ struct wg_socket {
 	struct socket	*so_so6;
 };
 
+struct wg_queue {
+	struct mtx			q_mtx;
+	struct mbufq			q;
+};
 
 struct wg_timers {
 	/* t_lock is for blocking wg_timers_event_* when setting t_disabled. */
@@ -136,24 +138,8 @@ struct wg_timers {
 	struct timespec		 t_handshake_complete;	/* nanotime */
 	int			 t_handshake_retries;
 
-	//	struct wg_timers_fn	*t_fn; /* not locked/mutex'd */
 };
 
-struct wg_pktq {
-	struct mtx			q_mtx;
-	size_t				q_len;
-	STAILQ_HEAD(, wg_queue_pkt)	q_items;
-};
-
-#if 0
-struct wg_timers_fn {
-	void (*f_send_initiation)(struct wg_timers *, int, int);
-	void (*f_send_keepalive)(struct wg_timers *);
-	void (*f_clear_secrets)(struct wg_timers *);
-	void (*f_clear_staged)(struct wg_timers *);
-	void (*f_clear_src)(struct wg_timers *);
-};
-#endif
 struct wg_peer {
 	uint64_t p_magic_1;
 	CK_LIST_ENTRY(wg_peer)	 p_hash_entry;
@@ -171,11 +157,10 @@ struct wg_peer {
 
 	uint64_t p_magic_2;
 
-	struct mbufq	 p_staged_packets;
 	struct grouptask		 p_send_staged;
 
-	struct wg_pktq	 p_send_queue;
-	struct wg_pktq	 p_recv_queue;
+	struct wg_queue	 p_encap_queue;
+	struct wg_queue	 p_decap_queue;
 	struct grouptask		 p_send;
 	struct grouptask		 p_recv;
 
@@ -197,41 +182,11 @@ struct wg_peer {
 void	wg_softc_decrypt(struct wg_softc *);
 void	wg_softc_encrypt(struct wg_softc *);
 
-struct wg_pkt_header {
-	uint32_t 	type;
-} __packed;
-
 /* Queue */
-struct wg_queue_pkt {
-	struct mbuf			*p_pkt;
-	STAILQ_ENTRY(wg_queue_pkt)	 p_serial;
-	STAILQ_ENTRY(wg_queue_pkt)	 p_parallel;
-	int				 p_done;
-	enum wg_pkt_state {
-		WG_PKT_STATE_NEW = 0,
-		WG_PKT_STATE_CRYPTED,
-		WG_PKT_STATE_CLEAR,
-		WG_PKT_STATE_DEAD,
-	}				 p_state;
-};
-
-
-void		 	 wg_pktq_init(struct wg_pktq *, const char *);
-void		 	 wg_pktq_deinit(struct wg_pktq *);
-void		 	 wg_pktq_enqueue(struct wg_pktq *parallel, struct
-		wg_pktq *serial, struct wg_queue_pkt *);
-struct wg_queue_pkt	*wg_pktq_parallel_dequeue(struct wg_pktq *);
-struct wg_queue_pkt	*wg_pktq_serial_dequeue(struct wg_pktq *);
-size_t			 wg_pktq_parallel_len(struct wg_pktq *);
-
+void		 	 wg_queue_init(struct wg_queue *, const char *);
+void		 	 wg_queue_deinit(struct wg_queue *);
 
 /* Counter */
-struct wg_counter {
-	struct mtx	c_mtx;
-	uint64_t	c_send;
-	uint64_t	c_recv;
-	COUNTER_TYPE	c_backtrack[COUNTER_BITS_TOTAL / __LONG_BIT];
-};
 
 /* Timers */
 #if 0
@@ -334,10 +289,13 @@ struct wg_softc {
 	struct noise_local	 sc_local;
 	struct cookie_checker sc_cookie;
 
-	struct wg_pktq sc_encrypt_queue;
-	struct wg_pktq sc_decrypt_queue;
+	struct buf_ring *sc_encap_ring;
+	struct buf_ring *sc_decap_ring;
+
 	struct grouptask		 sc_encrypt;
 	struct grouptask		 sc_decrypt;
+
+	struct mtx	sc_mtx;
 };
 
 struct wg_peer *
@@ -350,12 +308,10 @@ void	wg_peer_put(struct wg_peer *);
 void	wg_peer_remove_all(struct wg_softc *);
 int	wg_peer_create(struct wg_softc *, struct wg_peer_create_info *);
 
-
-void	wg_peer_send_staged_packets(struct wg_peer *);
-
 void	wg_hashtable_init(struct wg_hashtable *);
 void	wg_hashtable_destroy(struct wg_hashtable *);
 
+int	wg_queue_out(struct wg_peer *peer, struct mbuf *m);
 
 int	wg_route_init(struct wg_route_table *);
 
