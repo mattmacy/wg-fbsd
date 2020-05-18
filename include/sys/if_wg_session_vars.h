@@ -160,7 +160,9 @@ struct wg_peer {
 
 	struct wg_queue	 p_encap_queue;
 	struct wg_queue	 p_decap_queue;
+
 	struct grouptask		 p_send;
+	struct grouptask		 p_send_keepalive;
 	struct grouptask		 p_recv;
 
 	struct grouptask		 p_tx_initiation;

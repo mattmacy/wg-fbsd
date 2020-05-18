@@ -117,9 +117,9 @@ int	wg_socket_send_buffer(struct wg_socket *, void *, size_t,
 
 /* Timers */
 static void	wg_timers_retry_handshake(struct wg_timers *);
-void	wg_peer_expired_send_keepalive(struct wg_peer *);
+static void	wg_timers_send_keepalive(struct wg_timers *);
 void	wg_peer_expired_new_handshake(struct wg_peer *);
-static void wg_timers_peer_clear_secrets(struct wg_timers *t);
+static void	wg_timers_peer_clear_secrets(struct wg_timers *);
 static void	wg_peer_expired_send_persistent_keepalive(struct wg_timers *);
 static void	wg_timers_event_data_sent(struct wg_timers *);
 static void	wg_timers_event_data_received(struct wg_timers *);
@@ -190,7 +190,7 @@ void	wg_peer_enqueue_buffer(struct wg_peer *, void *, size_t);
 static int	wg_send_buf(struct wg_socket *, struct wg_endpoint *, uint8_t *, size_t);
 
 
-void	wg_peer_send_keepalive(struct wg_peer *);
+void	wg_send_keepalive(struct wg_peer *);
 void	wg_peer_flush_staged_packets(struct wg_peer *);
 
 /* Packet */
@@ -539,22 +539,18 @@ wg_timers_retry_handshake(struct wg_timers *t)
 	}
 }
 
-void
-wg_peer_expired_send_keepalive(struct wg_peer *peer)
+static void
+wg_timers_send_keepalive(struct wg_timers *t)
 {
-	wg_peer_send_keepalive(peer);
+	struct wg_peer	*peer = CONTAINER_OF(t, struct wg_peer, p_timers);
 
-	rw_wlock(&peer->p_timers.t_lock);
-	if (peer->p_timers.t_need_another_keepalive) {
-		peer->p_timers.t_need_another_keepalive = 0;
-		if (callout_reset(&peer->p_timers.t_send_keepalive,
-						  KEEPALIVE_TIMEOUT*hz,
-						  (timeout_t *)wg_peer_expired_send_keepalive,
-						  peer))
-			wg_peer_ref(peer);
+	GROUPTASK_ENQUEUE(&peer->p_send_keepalive);
+	if (t->t_need_another_keepalive) {
+		t->t_need_another_keepalive = 0;
+		callout_reset(&t->t_send_keepalive,
+		    KEEPALIVE_TIMEOUT*hz,
+		     (timeout_t *)wg_timers_send_keepalive, peer);
 	}
-	rw_wunlock(&peer->p_timers.t_lock);
-	wg_peer_put(peer);
 }
 
 void
@@ -591,7 +587,7 @@ wg_peer_expired_send_persistent_keepalive(struct wg_timers *t)
 {
 
 	if (t->t_persistent_keepalive_interval != 0)
-		wg_peer_send_keepalive(CONTAINER_OF(t, struct wg_peer, p_timers));
+		wg_send_keepalive(CONTAINER_OF(t, struct wg_peer, p_timers));
 }
 
 /* Should be called after an authenticated data packet is sent. */
@@ -618,7 +614,7 @@ wg_timers_event_data_received(struct wg_timers *t)
 	NET_EPOCH_ENTER(et);
 	if (!callout_pending(&t->t_send_keepalive)) {
 		callout_reset(&t->t_send_keepalive, KEEPALIVE_TIMEOUT*hz,
-		    (timeout_t *)wg_peer_expired_send_persistent_keepalive, t);
+		    (timeout_t *)wg_timers_send_keepalive, t);
 	} else {
 		t->t_need_another_keepalive = 1;
 	}
@@ -681,7 +677,7 @@ wg_timers_event_handshake_complete(struct wg_timers *t)
 		ready = 1;
 	}
 	if (ready)
-		wg_peer_send_keepalive(CONTAINER_OF(t, struct wg_peer, p_timers));
+		wg_send_keepalive(CONTAINER_OF(t, struct wg_peer, p_timers));
 	NET_EPOCH_EXIT(et);
 }
 
@@ -1271,6 +1267,9 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	wg_queue_init(&peer->p_encap_queue, "sendq");
 	wg_queue_init(&peer->p_decap_queue, "rxq");
 
+	GROUPTASK_INIT(&peer->p_send_keepalive, 0, (gtask_fn_t *)wg_send_keepalive, peer);
+	taskqgroup_attach(qgroup_if_io_tqg, &peer->p_send_keepalive, peer, dev, NULL, "wg keepalive");
+
 	GROUPTASK_INIT(&peer->p_send, 0, (gtask_fn_t *)wg_deliver_out, peer);
 	taskqgroup_attach(qgroup_if_io_tqg, &peer->p_send, peer, dev, NULL, "wg send");
 	GROUPTASK_INIT(&peer->p_recv, 0, (gtask_fn_t *)wg_deliver_in, peer);
@@ -1330,9 +1329,11 @@ wg_peer_destroy(struct wg_peer **peer_p)
 	 * can hang around for longer than we want. */
 	wg_peer_timers_stop(peer);
 	GROUPTASK_DRAIN(&peer->p_send_staged);
+	GROUPTASK_DRAIN(&peer->p_send_keepalive);
 	GROUPTASK_DRAIN(&peer->p_send);
 	GROUPTASK_DRAIN(&peer->p_recv);
 	GROUPTASK_DRAIN(&peer->p_tx_initiation);
+	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_send_keepalive);
 	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_send_staged);
 	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_send);
 	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_recv);
@@ -1618,7 +1619,7 @@ retry:
 }
 
 void
-wg_peer_send_keepalive(struct wg_peer *peer)
+wg_send_keepalive(struct wg_peer *peer)
 {
 	struct mbuf *m = NULL;
 	struct wg_tag *t;
@@ -1877,7 +1878,7 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 			 * queue, it will send a keepalive, in order to give
 			 * immediate confirmation of the session.
 			 */
-			wg_peer_send_keepalive(peer);
+			wg_send_keepalive(peer);
 		}
 		break;
 	case MESSAGE_HANDSHAKE_COOKIE:
