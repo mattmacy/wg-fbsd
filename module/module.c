@@ -53,10 +53,6 @@ __FBSDID("$FreeBSD$");
 
 #include "ifdi_if.h"
 
-#if 0
-#include <sys/noise.h>
-#include <sys/ratelimiter.h>
-#endif
 #include <sys/wg_module.h>
 #include <crypto/zinc.h>
 #include <sys/wg_noise.h>
