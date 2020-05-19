@@ -180,7 +180,6 @@ static struct wg_endpoint *wg_mbuf_endpoint_get(struct mbuf *);
 void	wg_receive_handshake_packet(struct wg_softc *, struct mbuf *);
 static void	wg_encap(struct wg_softc *, struct mbuf *);
 static void	wg_decap(struct wg_softc *, struct mbuf *);
-void	wg_softc_handshake_receive(struct wg_softc *);
 
 /* Interface */
 static void wg_input(struct mbuf *m, int offset, struct inpcb *inpcb,
@@ -191,6 +190,17 @@ static void wg_input(struct mbuf *m, int offset, struct inpcb *inpcb,
 static volatile unsigned long peer_counter = 0;
 static struct timeval	rekey_interval = { REKEY_TIMEOUT, 0 };
 
+static void
+m_calchdrlen(struct mbuf *m)
+{
+       struct mbuf *n;
+       int plen = 0;
+
+       MPASS(m->m_flags & M_PKTHDR);
+       for (n = m; n; n = n->m_next)
+               plen += n->m_len;
+       m->m_pkthdr.len = plen;
+}
 
 static inline int
 callout_del(struct callout *c)
@@ -1631,18 +1641,6 @@ free:
 }
 
 static void
-m_calchdrlen(struct mbuf *m)
-{
-       struct mbuf *n;
-       int plen = 0;
-
-       MPASS(m->m_flags & M_PKTHDR);
-       for (n = m; n; n = n->m_next)
-               plen += n->m_len;
-       m->m_pkthdr.len = plen;
-}
-
-static void
 wg_encap(struct wg_softc *sc, struct mbuf *m)
 {
 	struct wg_pkt_data *data;
@@ -1786,11 +1784,8 @@ wg_softc_decrypt(struct wg_softc *sc)
 	struct mbuf *m;
 
 	NET_EPOCH_ENTER(et);
-
-
 	while ((m = buf_ring_dequeue_mc(sc->sc_decap_ring)) != NULL)
 		wg_decap(sc, m);
-
 	NET_EPOCH_EXIT(et);
 }
 
@@ -1804,6 +1799,53 @@ wg_softc_encrypt(struct wg_softc *sc)
 	while ((m = buf_ring_dequeue_mc(sc->sc_encap_ring)) != NULL)
 		wg_encap(sc, m);
 	NET_EPOCH_EXIT(et);
+}
+
+struct noise_remote *
+wg_remote_get(struct wg_softc *sc, uint8_t public[NOISE_KEY_SIZE])
+{
+#if 0
+	struct wg_peer *peer;
+	if ((peer = wg_peer_lookup(sc, public)) == NULL)
+		return NULL;
+	return &peer->p_remote;
+#endif
+	return NULL;
+}
+
+uint32_t
+wg_index_set(struct wg_softc *sc, struct noise_remote *remote)
+{
+#if 0
+	struct wg_index *index, *iter;
+	struct wg_peer	*peer;
+	uint32_t	 key;
+
+	/* We can modify this without a lock as wg_index_set, wg_index_drop are
+	 * guaranteed to be serialised (per remote). */
+	peer = CONTAINER_OF(remote, struct wg_peer, p_remote);
+	index = SLIST_FIRST(&peer->p_unused_index);
+	KASSERT(index != NULL);
+	SLIST_REMOVE_HEAD(&peer->p_unused_index, i_unused_entry);
+
+	index->i_value = remote;
+
+	rw_enter_write(&sc->sc_index_lock);
+assign_id:
+	key = index->i_key = arc4random();
+	key &= sc->sc_index_mask;
+	LIST_FOREACH(iter, &sc->sc_index[key], i_entry)
+		if (iter->i_key == index->i_key)
+			goto assign_id;
+
+	LIST_INSERT_HEAD(&sc->sc_index[key], index, i_entry);
+
+	rw_exit_write(&sc->sc_index_lock);
+
+	/* Likewise, no need to lock for index here. */
+	return index->i_key;
+#endif
+	return 0;
 }
 
 struct noise_remote *
