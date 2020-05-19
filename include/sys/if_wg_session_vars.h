@@ -156,16 +156,14 @@ struct wg_peer {
 
 	uint64_t p_magic_2;
 
-	struct grouptask		 p_send_staged;
-
 	struct wg_queue	 p_encap_queue;
 	struct wg_queue	 p_decap_queue;
 
-	struct grouptask		 p_send;
+	struct grouptask		 p_clear_secrets;
+	struct grouptask		 p_send_initiation;
 	struct grouptask		 p_send_keepalive;
+	struct grouptask		 p_send;
 	struct grouptask		 p_recv;
-
-	struct grouptask		 p_tx_initiation;
 
 	counter_u64_t		 p_tx_bytes;
 	counter_u64_t		 p_rx_bytes;
@@ -320,6 +318,8 @@ int wg_socket_init(struct wg_softc *sc);
 void wg_socket_reinit(struct wg_softc *, struct socket *so4,
     struct socket *so6);
 void wg_softc_handshake_receive(struct wg_softc *sc);
+
+void	wg_timers_get_last_handshake(struct wg_timers *, struct timespec *);
 
 void wg_cookie_checker_precompute_device_keys(struct wg_softc *sc);
 
