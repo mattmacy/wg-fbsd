@@ -106,11 +106,9 @@ struct wg_tag {
 #define DPRINTF(sc,  ...) if_printf(sc->sc_ifp, ##__VA_ARGS__)
 
 /* Socket */
-void	wg_socket_softclose(struct wg_socket *);
 int	wg_socket_close(struct wg_socket *);
 static int	wg_socket_bind(struct wg_softc *sc, struct wg_socket *);
-int	wg_socket_port_set(struct wg_socket *, in_port_t);
-int	wg_send(struct wg_socket *, struct wg_endpoint *, struct mbuf *);
+static int	wg_send(struct wg_socket *, struct wg_endpoint *, struct mbuf *);
 
 /* Timers */
 static void	wg_timers_retry_handshake(struct wg_timers *);
@@ -135,16 +133,14 @@ int	wg_timers_expired(struct timespec *, time_t, long);
 
 /* Queue */
 static int	wg_queue_in(struct wg_peer *, struct mbuf *);
-static struct mbuf *
-	wg_queue_dequeue(struct wg_queue *, struct wg_tag **);
+static struct mbuf *wg_queue_dequeue(struct wg_queue *, struct wg_tag **);
 
 /* Route */
 void	wg_route_destroy(struct wg_route_table *);
 int	wg_route_add(struct wg_route_table *, struct wg_peer *,
-			     const struct wg_allowedip *);
+    const struct wg_allowedip *);
 int	wg_route_delete(struct wg_route_table *, struct wg_peer *,
-				const struct wg_allowedip *);
-
+    const struct wg_allowedip *);
 
 /* Hashtable */
 void	wg_hashtable_peer_insert(struct wg_hashtable *, struct wg_peer *);
@@ -153,35 +149,25 @@ struct wg_peer *
 				 const uint8_t [WG_KEY_SIZE]);
 void	wg_hashtable_peer_remove(struct wg_hashtable *, struct wg_peer *);
 
-/* Noise */
-
-/* Rate limiting */
-void	wg_ratelimiter_init(struct wg_ratelimiter *);
-void	wg_ratelimiter_uninit(struct wg_ratelimiter *);
-int	wg_ratelimiter_allow(struct wg_ratelimiter *, struct mbuf *);
-
 /* Cookie */
 
-int
-	wg_cookie_validate_packet(struct cookie_checker *, struct mbuf *,
-				  int);
-void	wg_cookie_message_consume(struct wg_pkt_cookie *, struct wg_softc *);
+static int wg_cookie_validate_packet(struct cookie_checker *, struct mbuf *,
+    int);
+static void	wg_cookie_message_consume(struct wg_pkt_cookie *, struct wg_softc *);
 
 /* Peer */
 void	wg_peer_destroy(struct wg_peer **);
 void	wg_peer_free(epoch_context_t ctx);
 
 static void	wg_send_initiation(struct wg_peer *);
-void	wg_send_cookie(struct wg_softc *, struct cookie_macs *, uint32_t, struct mbuf *);
+static void	wg_send_cookie(struct wg_softc *, struct cookie_macs *, uint32_t, struct mbuf *);
 
-void	wg_peer_set_endpoint_from_mbuf(struct wg_peer *, struct mbuf *);
+static void	wg_peer_set_endpoint_from_tag(struct wg_peer *, struct wg_tag *);
 static void	wg_peer_clear_src(struct wg_peer *);
 static void	wg_peer_get_endpoint(struct wg_peer *, struct wg_endpoint *);
-int	wg_peer_mbuf_add_ipudp(struct wg_peer *, struct mbuf **);
 
 static void	wg_deliver_out(struct wg_peer *);
 static void	wg_deliver_in(struct wg_peer *);
-void	wg_peer_enqueue_buffer(struct wg_peer *, void *, size_t);
 static int	wg_send_buf(struct wg_socket *, struct wg_endpoint *, uint8_t *, size_t);
 
 
@@ -189,10 +175,7 @@ void	wg_send_keepalive(struct wg_peer *);
 void	wg_peer_flush_staged_packets(struct wg_peer *);
 
 /* Packet */
-static struct wg_endpoint *
-	wg_mbuf_endpoint_get(struct mbuf *);
-int	wg_mbuf_add_ipudp(struct mbuf **, struct wg_socket *,
-			  struct wg_endpoint *);
+static struct wg_endpoint *wg_mbuf_endpoint_get(struct mbuf *);
 
 void	wg_receive_handshake_packet(struct wg_softc *, struct mbuf *);
 static void	wg_encap(struct wg_softc *, struct mbuf *);
@@ -200,12 +183,8 @@ static void	wg_decap(struct wg_softc *, struct mbuf *);
 void	wg_softc_handshake_receive(struct wg_softc *);
 
 /* Interface */
-void	wg_start(struct ifqueue *);
-int	wg_output(struct ifnet *, struct mbuf *, struct sockaddr *,
-		  struct rtentry *);
-void
-wg_input(struct mbuf *m, int offset, struct inpcb *inpcb,
-		 const struct sockaddr *srcsa, void *_sc);
+static void wg_input(struct mbuf *m, int offset, struct inpcb *inpcb,
+    const struct sockaddr *srcsa, void *_sc);
 
 /* Globals */
 
@@ -218,7 +197,6 @@ callout_del(struct callout *c)
 {
 	return (callout_stop(c) > 0);
 }
-
 
 static struct wg_tag *
 wg_tag_get(struct mbuf *m)
@@ -366,11 +344,6 @@ wg_socket_reinit(struct wg_softc *sc, struct socket *new4,
 	so->so_so6 = new6;
 }
 
-void
-wg_socket_softclose(struct wg_socket *so)
-{
-}
-
 int
 wg_socket_close(struct wg_socket *so)
 {
@@ -423,90 +396,46 @@ wg_socket_bind(struct wg_softc *sc, struct wg_socket *so)
 		if_printf(ifp, "can't bind AF_INET6 socket %d\n", rc);
 	return (rc);
 }
-#if 0
-int
-wg_socket_port_set(struct wg_socket *so, in_port_t port)
-{
-	int ret;
-	mtx_lock(&so->so_mtx);
-	so->so_port = port;
-	ret = wg_socket_bind(so);
-	mtx_unlock(&so->so_mtx);
-	return ret;
-}
-#endif
 
-int
+static int
 wg_send(struct wg_socket *so, struct wg_endpoint *e, struct mbuf *m)
 {
-	int err, size;
-	struct inpcb *inp;
-	struct mbuf *mp;
-	sa_family_t family;
+	struct epoch_tracker et;
+	struct sockaddr *sa;
+	struct mbuf	 *control = NULL;
+	int		 ret;
 
-	err = 0;
-	family = e->e_remote.r_sa.sa_family;
-	switch (family) {
-		case AF_INET: {
-			size = sizeof(struct ip) + sizeof(struct udphdr);
-			inp = sotoinpcb(so->so_so4);
-			break;
-		}
-		case AF_INET6: {
-			size = sizeof(struct ip6_hdr) + sizeof(struct udphdr);
-			inp = sotoinpcb(so->so_so6);
-			break;
-		}
-	default:
+	/* Get local control address before locking */
+	if (e->e_remote.r_sa.sa_family == AF_INET) {
+		if (e->e_local.l_in.s_addr != INADDR_ANY)
+			control = sbcreatecontrol((caddr_t)&e->e_local.l_in,
+			    sizeof(struct in_addr), IP_SENDSRCADDR,
+			    IPPROTO_IP);
+	} else if (e->e_remote.r_sa.sa_family == AF_INET6) {
+		if (!IN6_IS_ADDR_UNSPECIFIED(&e->e_local.l_in6))
+			control = sbcreatecontrol((caddr_t)&e->e_local.l_pktinfo6,
+			    sizeof(struct in6_pktinfo), IPV6_PKTINFO,
+			    IPPROTO_IPV6);
+	} else {
+		return EAFNOSUPPORT;
+	}
+
+	/* Get remote address */
+	sa = &e->e_remote.r_sa;
+
+	NET_EPOCH_ENTER(et);
+	if (e->e_remote.r_sa.sa_family == AF_INET && so->so_so4 != NULL)
+		ret = sosend(so->so_so4, sa, NULL, m, control, 0, curthread);
+	else if (e->e_remote.r_sa.sa_family == AF_INET6 && so->so_so6 != NULL)
+		ret = sosend(so->so_so6, sa, NULL, m, control, 0, curthread);
+	else {
+		ret = ENOTCONN;
+		m_freem(control);
 		m_freem(m);
-		err = EAFNOSUPPORT;
 	}
-	if (err)
-		return (err);
-	if (m->m_len == 0) {
-		if ((mp = m_pullup(m, size)) == NULL)
-			return (ENOMEM);
-	}
-
-	CURVNET_SET(inp->inp_vnet);
-	switch (family) {
-		case AF_INET: {
-			err = ip_output(m, NULL, NULL, IP_RAWOUTPUT, NULL, NULL);
-			break;
-		}
-		case AF_INET6: {
-			err = ip6_output(m, NULL, NULL, IPV6_MINMTU, NULL, NULL, NULL);
-			break;
-		}
-	}
-	if (err)
-		log(LOG_WARNING, "ip_output()->%d\n", err);
-	CURVNET_RESTORE();
-	return (err);
+	NET_EPOCH_EXIT(et);
+	return (ret);
 }
-
-#if 0
-int
-wg_socket_send_buffer(struct wg_socket *so, void *buf, size_t len,
-		      struct wg_endpoint *dst)
-{
-	int err;
-	struct mbuf *m;
-
-	m = m_gethdr(M_WAITOK, MT_DATA);
-	m->m_len = 0;
-	m_copyback(m, 0, len, buf);
-
-	MPASS(len != 0);
-	if ((err = wg_mbuf_add_ipudp(&m, so, dst)) != 0) {
-		m_freem(m);
-		return err;
-	}
-	MPASS(m->m_pkthdr.len == len);
-	MPASS(m->m_len != 0);
-	return wg_send(so, dst, m);
-}
-#endif
 
 /* Timers */
 void
@@ -1134,37 +1063,11 @@ wg_hashtable_peer_remove(struct wg_hashtable *ht, struct wg_peer *peer)
 	ht->h_num_peers--;
 	CK_LIST_REMOVE(peer, p_hash_entry);
 	CK_LIST_REMOVE(peer, p_entry);
-	wg_peer_put(peer);
 	mtx_unlock(&ht->h_mtx);
 }
 
-/*
- * Ratelimiter
- *
- *
- *
- */
-void
-wg_ratelimiter_init(struct wg_ratelimiter *ratelimiter)
-{
-
-}
-
-void
-wg_ratelimiter_uninit(struct wg_ratelimiter *ratelimiter)
-{
-
-}
-
-int
-wg_ratelimiter_allow(struct wg_ratelimiter *ratelimiter, struct mbuf *m)
-{
-	//return ECONNREFUSED;
-	return 0;
-}
-
 /* Cookie */
-int
+static int
 wg_cookie_validate_packet(struct cookie_checker *checker, struct mbuf *m,
     int under_load)
 {
@@ -1193,20 +1096,19 @@ wg_cookie_validate_packet(struct cookie_checker *checker, struct mbuf *m,
 	    under_load, &e->e_remote.r_sa));
 }
 
-void
+static void
 wg_cookie_message_consume(struct wg_pkt_cookie *cook, struct wg_softc *sc)
 {
 	struct noise_remote		*remote;
 	struct wg_peer *peer;
 
-		if ((remote = wg_index_get(sc, cook->r_idx)) == NULL) {
-			DPRINTF(sc, "Unknown cookie index\n");
-			return;
-		}
+	if ((remote = wg_index_get(sc, cook->r_idx)) == NULL) {
+		DPRINTF(sc, "Unknown cookie index\n");
+		return;
+	}
 
-		peer = CONTAINER_OF(remote, struct wg_peer, p_remote);
-		cookie_maker_consume_payload(&peer->p_cookie,
-									 cook->nonce, cook->ec);
+	peer = CONTAINER_OF(remote, struct wg_peer, p_remote);
+	cookie_maker_consume_payload(&peer->p_cookie, cook->nonce, cook->ec);
 }
 
 /* Peer */
@@ -1292,23 +1194,6 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	return (0);
 }
 
-struct wg_peer *
-wg_peer_ref(struct wg_peer *peer)
-{
-	if (peer != NULL)
-		refcount_acquire(&peer->p_refcnt);
-	return (peer);
-}
-
-void
-wg_peer_put(struct wg_peer *peer)
-{
-	return; /* XXX */
-
-	if (peer != NULL && refcount_release(&peer->p_refcnt))
-		NET_EPOCH_CALL(wg_peer_free, &peer->p_ctx);
-}
-
 void
 wg_peer_destroy(struct wg_peer **peer_p)
 {
@@ -1342,8 +1227,6 @@ wg_peer_destroy(struct wg_peer **peer_p)
 	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_send);
 	wg_queue_deinit(&peer->p_encap_queue);
 	wg_queue_deinit(&peer->p_decap_queue);
-
-	wg_peer_put(peer);
 }
 
 void
@@ -1360,6 +1243,18 @@ wg_peer_free(epoch_context_t ctx)
 	zfree(peer, M_WG);
 }
 
+static int
+wg_peer_send_buf(struct wg_peer *peer, uint8_t *buf, size_t len)
+{
+	struct wg_endpoint	 endpoint;
+
+	counter_u64_add(peer->p_tx_bytes, len);
+	wg_timers_event_any_authenticated_packet_traversal(&peer->p_timers);
+	wg_timers_event_any_authenticated_packet_sent(&peer->p_timers);
+	wg_peer_get_endpoint(peer, &endpoint);
+	return wg_send_buf(&peer->p_sc->sc_socket, &endpoint, buf, len);
+}
+
 static void
 wg_send_initiation(struct wg_peer *peer)
 {
@@ -1374,7 +1269,7 @@ wg_send_initiation(struct wg_peer *peer)
 	pkt.t = le32toh(MESSAGE_HANDSHAKE_INITIATION);
 	cookie_maker_mac(&peer->p_cookie, &pkt.m, &pkt,
 	    sizeof(pkt)-sizeof(pkt.m));
-	wg_peer_enqueue_buffer(peer, &pkt, sizeof(pkt));
+	wg_peer_send_buf(peer, (uint8_t *)&pkt, sizeof(pkt));
 	wg_timers_event_handshake_initiated(&peer->p_timers);
 out:
 	NET_EPOCH_EXIT(et);
@@ -1398,14 +1293,14 @@ wg_send_response(struct wg_peer *peer)
 	pkt.t = MESSAGE_HANDSHAKE_RESPONSE;
 	cookie_maker_mac(&peer->p_cookie, &pkt.m, &pkt,
 	     sizeof(pkt)-sizeof(pkt.m));
-	wg_peer_enqueue_buffer(peer, &pkt, sizeof(pkt));
+	wg_peer_send_buf(peer, (uint8_t*)&pkt, sizeof(pkt));
 	wg_timers_event_handshake_responded(&peer->p_timers);
 out:
 	NET_EPOCH_EXIT(et);
 	return (ret);
 }
 
-void
+static void
 wg_send_cookie(struct wg_softc *sc, struct cookie_macs *cm, uint32_t idx,
     struct mbuf *m)
 {
@@ -1423,10 +1318,10 @@ wg_send_cookie(struct wg_softc *sc, struct cookie_macs *cm, uint32_t idx,
 	wg_send_buf(&sc->sc_socket, e, (uint8_t *)&pkt, sizeof(pkt));
 }
 
-void
-wg_peer_set_endpoint_from_mbuf(struct wg_peer *peer, struct mbuf *m)
+static void
+wg_peer_set_endpoint_from_tag(struct wg_peer *peer, struct wg_tag *t)
 {
-	struct wg_endpoint *e = wg_mbuf_endpoint_get(m);
+	struct wg_endpoint *e = &t->t_endpoint;
 
 	MPASS(e->e_remote.r_sa.sa_family != 0);
 	if (memcmp(e, &peer->p_endpoint, sizeof(*e)) == 0)
@@ -1447,14 +1342,6 @@ static void
 wg_peer_get_endpoint(struct wg_peer *p, struct wg_endpoint *e)
 {
 	memcpy(e, &p->p_endpoint, sizeof(*e));
-}
-
-int
-wg_peer_mbuf_add_ipudp(struct wg_peer *peer, struct mbuf **m)
-{
-	int err;
-	err = wg_mbuf_add_ipudp(m, &peer->p_sc->sc_socket, &peer->p_endpoint);
-	return err;
 }
 
 void
@@ -1554,30 +1441,6 @@ wg_deliver_in(struct wg_peer *peer)
 	NET_EPOCH_EXIT(et);
 }
 
-#if 0
-void
-wg_peer_enqueue_buffer(struct wg_peer *peer, void *buf, size_t len)
-{
-	struct mbuf *m;
-
-	m = m_gethdr(M_WAITOK, MT_DATA);
-	m->m_len = 0;
-	m_copyback(m, 0, len, buf);
-
-	if (wg_peer_mbuf_add_ipudp(peer, &m) != 0) {
-		m_freem(m);
-		return;
-	}
-
-	MPASS(m->m_len > 0);
-	MPASS(m->m_pkthdr.len > 0);
-	MPASS(m->m_pkthdr.len == len);
-
-	wg_pktq_serial_enqueue(&peer->p_encap_queue, pkt);
-	GROUPTASK_ENQUEUE(&peer->p_send);
-}
-#endif
-
 int
 wg_send_buf(struct wg_socket *so, struct wg_endpoint *e, uint8_t *buf,
     size_t len)
@@ -1633,7 +1496,6 @@ send:
 }
 
 /* Packet */
-
 static void
 verify_endpoint(struct mbuf *m)
 {
@@ -1644,135 +1506,6 @@ verify_endpoint(struct mbuf *m)
 #endif
 }
 
-static int
-wg_laddr_v4(struct inpcb *inp, struct in_addr *laddr4, struct wg_endpoint *e)
-{
-	int err;
-
-	if (e->e_local.l_in.s_addr == INADDR_ANY) {
-			CURVNET_SET(inp->inp_vnet);
-			err = in_pcbladdr(inp, &e->e_remote.r_sin.sin_addr, laddr4, curthread->td_ucred);
-			CURVNET_RESTORE();
-			if (err != 0) {
-				printf("in_pcbladdr() -> %d\n", err);
-				return err;
-			}
-			e->e_local.l_in = *laddr4;
-		}
-		return (0);
-}
-
-static int
-wg_laddr_v6(struct inpcb *inp, struct in6_addr *laddr6, struct wg_endpoint *e)
-{
-	int err;
-
-		if (IN6_IS_ADDR_UNSPECIFIED(&e->e_local.l_in6)) {
-			err = in6_selectsrc_addr(0, &e->e_remote.r_sin6.sin6_addr, 0,
-									 NULL, laddr6, NULL);
-			if (err != 0)
-				return err;
-			e->e_local.l_in6 = *laddr6;
-		}
-		return (0);
-}
-
-int
-wg_mbuf_add_ipudp(struct mbuf **m0, struct wg_socket *so, struct wg_endpoint *e)
-{
-	struct mbuf *m = *m0;
-	int err, len = m->m_pkthdr.len;
-	struct inpcb *inp;
-	struct thread *td;
-
-	struct ip *ip4;
-	struct ip6_hdr *ip6;
-	struct udphdr *udp;
-
-	struct in_addr laddr4;
-	struct in6_addr laddr6;
-	in_port_t rport;
-	uint8_t  pr;
-
-	MPASS(len > 0);
-	MPASS(m->m_len > 0);
-	td = curthread;
-	if (e->e_remote.r_sa.sa_family == AF_INET) {
-		int size = sizeof(*ip4) + sizeof(*udp);
-		m = m_prepend(m, size, M_WAITOK);
-		bzero(m->m_data, size);
-		m->m_pkthdr.flowid = AF_INET;
-		inp = sotoinpcb(so->so_so4);
-
-		ip4 = mtod(m, struct ip *);
-		ip4->ip_v	= IPVERSION;
-		ip4->ip_hl	= sizeof(*ip4) >> 2;
-		// XXX
-		// ip4->ip_tos	= inp->inp_ip.ip_tos; /* TODO ECN */
-		ip4->ip_len	= htons(sizeof(*ip4) + sizeof(*udp) + len);
-		//ip4->ip_id	= htons(ip_randomid());
-		ip4->ip_off	= 0;
-		ip4->ip_ttl	= 127;
-		ip4->ip_p	= IPPROTO_UDP;
-
-		if ((err = wg_laddr_v4(inp, &laddr4, e)))
-			return (err);
-
-		ip4->ip_src	= e->e_local.l_in;
-		ip4->ip_dst	= e->e_remote.r_sin.sin_addr;
-		rport		= e->e_remote.r_sin.sin_port;
-
-		udp = (struct udphdr *)(mtod(m, caddr_t) + sizeof(*ip4));
-		udp->uh_dport = rport;
-		udp->uh_ulen = htons(sizeof(*udp) + len);
-		udp->uh_sport = htons(so->so_port);
-		pr  = inp->inp_socket->so_proto->pr_protocol;
-		udp->uh_sum =  in_pseudo(ip4->ip_src.s_addr, ip4->ip_dst.s_addr,
-		    htons((u_short)len + sizeof(struct udphdr) + pr));
-	} else if (e->e_remote.r_sa.sa_family == AF_INET6) {
-		m = m_prepend(m, sizeof(*ip6) + sizeof(*udp), M_WAITOK);
-		m->m_pkthdr.flowid = AF_INET;
-
-		inp = sotoinpcb(so->so_so6);
-
-		ip6 = mtod(m, struct ip6_hdr *);
-		/* TODO ECN */
-		//ip6->ip6_flow	 = inp->inp_flowinfo & IPV6_FLOWINFO_MASK;
-		ip6->ip6_vfc	&= ~IPV6_VERSION_MASK;
-		ip6->ip6_vfc	|= IPV6_VERSION;
-#if 0	/* ip6_plen will be filled in ip6_output. */
-		ip6->ip6_plen	 = htons(XXX);
-#endif
-		ip6->ip6_nxt	 = IPPROTO_UDP;
-		ip6->ip6_hlim	 = in6_selecthlim(inp, NULL);
-
-		if ((err = wg_laddr_v6(inp, &laddr6, e)))
-			return (err);
-
-		ip6->ip6_src	 = e->e_local.l_in6;
-		/* ip6->ip6_dst	 = e->e_remote.r_sin6.sin6_addr; */
-		rport		 = e->e_remote.r_sin6.sin6_port;
-
-		if (sa6_embedscope(&e->e_remote.r_sin6, 0) != 0)
-			return ENXIO;
-
-		udp = (struct udphdr *)(mtod(m, caddr_t) + sizeof(*ip6));
-
-	} else {
-		kdb_backtrace();
-		printf("%s bad family\n", __func__);
-		return EAFNOSUPPORT;
-	}
-
-	m->m_flags &= ~(M_BCAST|M_MCAST);
-	m->m_pkthdr.csum_flags = CSUM_UDP | CSUM_UDP_IPV6;
-	m->m_pkthdr.csum_data = offsetof(struct udphdr, uh_sum);
-
-	*m0 = m;
-
-	return 0;
-}
-
 void
 wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 {
@@ -1781,6 +1514,7 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 	struct noise_remote	*remote;
 	struct wg_pkt_cookie		*cook;
 	struct wg_peer	*peer;
+	struct wg_tag *t;
 
 	/* This is global, so that our load calculation applies to the whole
 	 * system. We don't care about races with it at all.
@@ -1810,6 +1544,7 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 		goto free;
 	packet_needs_cookie = (res == EAGAIN);
 
+	t = wg_tag_get(m);
 	switch (le32toh(*mtod(m, uint32_t *))) {
 	case MESSAGE_HANDSHAKE_INITIATION:
 		init = mtod(m, struct wg_pkt_initiation *);
@@ -1853,7 +1588,7 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 		DPRINTF(sc, "Receiving handshake response from peer %lu\n",
 				peer->p_id);
 		counter_u64_add(peer->p_rx_bytes, sizeof(*resp));
-		wg_peer_set_endpoint_from_mbuf(peer, m);
+		wg_peer_set_endpoint_from_tag(peer, t);
 		if (noise_remote_begin_session(&peer->p_remote) == 0) {
 			wg_timers_event_session_derived(&peer->p_timers);
 			wg_timers_event_handshake_complete(&peer->p_timers);
@@ -1960,8 +1695,6 @@ wg_encap(struct wg_softc *sc, struct mbuf *m)
 	m_calchdrlen(mc);
 
 	counter_u64_add(peer->p_tx_bytes, m->m_pkthdr.len);
-	if (wg_peer_mbuf_add_ipudp(peer, &mc) == 0)
-		;
 
 	m_freem(m);
 	t->t_mbuf = m;
@@ -2000,7 +1733,7 @@ wg_decap(struct wg_softc *sc, struct mbuf *m)
 		}
 	}
 
-	wg_peer_set_endpoint_from_mbuf(peer, m);
+	wg_peer_set_endpoint_from_tag(peer, t);
 	counter_u64_add(peer->p_rx_bytes, m->m_pkthdr.len);
 
 	/* Remove the data header, and crypto mac tail from the packet */
@@ -2023,7 +1756,6 @@ wg_decap(struct wg_softc *sc, struct mbuf *m)
 	}
 
 	routed_peer = wg_route_lookup(&peer->p_sc->sc_routes, m, IN);
-	wg_peer_put(routed_peer);
 	if (routed_peer != peer) {
 		DPRINTF(peer->p_sc, "Packet has unallowed src IP from peer "
 				"%lu\n", peer->p_id);
@@ -2117,7 +1849,7 @@ wg_index_drop(struct wg_softc *sc, uint32_t key0)
 #endif
 }
 
-void
+static void
 wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 		 const struct sockaddr *srcsa, void *_sc)
 {
