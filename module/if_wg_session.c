@@ -114,7 +114,7 @@ static int	wg_send(struct wg_socket *, struct wg_endpoint *, struct mbuf *);
 static void	wg_timers_retry_handshake(struct wg_timers *);
 static void	wg_timers_send_keepalive(struct wg_timers *);
 static void	wg_timers_new_handshake(struct wg_timers *);
-static void	wg_timers_peer_clear_secrets(struct wg_timers *);
+static void	wg_timers_zero_key_material(struct wg_timers *);
 static void	wg_peer_expired_send_persistent_keepalive(struct wg_timers *);
 static void	wg_timers_event_data_sent(struct wg_timers *);
 static void	wg_timers_event_data_received(struct wg_timers *);
@@ -144,16 +144,14 @@ int	wg_route_delete(struct wg_route_table *, struct wg_peer *,
 
 /* Hashtable */
 void	wg_hashtable_peer_insert(struct wg_hashtable *, struct wg_peer *);
-struct wg_peer *
-	wg_hashtable_peer_lookup(struct wg_hashtable *,
-				 const uint8_t [WG_KEY_SIZE]);
+static struct wg_peer *wg_peer_lookup(struct wg_hashtable *,
+    const uint8_t [WG_KEY_SIZE]);
 void	wg_hashtable_peer_remove(struct wg_hashtable *, struct wg_peer *);
 
 /* Cookie */
 
 static int wg_cookie_validate_packet(struct cookie_checker *, struct mbuf *,
     int);
-static void	wg_cookie_message_consume(struct wg_pkt_cookie *, struct wg_softc *);
 
 /* Peer */
 void	wg_peer_destroy(struct wg_peer **);
@@ -177,7 +175,7 @@ void	wg_peer_flush_staged_packets(struct wg_peer *);
 /* Packet */
 static struct wg_endpoint *wg_mbuf_endpoint_get(struct mbuf *);
 
-void	wg_receive_handshake_packet(struct wg_softc *, struct mbuf *);
+static void	wg_handshake(struct wg_softc *, struct mbuf *);
 static void	wg_encap(struct wg_softc *, struct mbuf *);
 static void	wg_decap(struct wg_softc *, struct mbuf *);
 
@@ -471,7 +469,7 @@ wg_timers_retry_handshake(struct wg_timers *t)
 		callout_del(&t->t_send_keepalive);
 		if (!callout_pending(&t->t_zero_key_material))
 			callout_reset(&t->t_zero_key_material, REJECT_AFTER_TIME * 3 * hz,
-			    (timeout_t *)wg_timers_peer_clear_secrets, t);
+			    (timeout_t *)wg_timers_zero_key_material, t);
 	}
 }
 
@@ -512,17 +510,15 @@ wg_timers_new_handshake(struct wg_timers *t)
 	    NEW_HANDSHAKE_TIMEOUT);
 	GROUPTASK_ENQUEUE(&peer->p_send_initiation);
 }
-static void
-wg_timers_peer_clear_secrets(struct wg_timers *t)
-{
 
+static void
+wg_timers_zero_key_material(struct wg_timers *t)
+{
 	struct wg_peer *peer = CONTAINER_OF(t, struct wg_peer, p_timers);
 	DPRINTF(peer->p_sc, "Zeroing out all keys for peer %lu, since we "
 			"haven't received a new one in %d seconds\n",
 			peer->p_id, REJECT_AFTER_TIME * 3);
-	panic("XXX replace");
-	// 	task_add(wg_handshake_taskq, &peer->p_clear_secrets);
-	/* wg_timers_peer_clear_secrets(struct wg_timers *t) */
+	GROUPTASK_ENQUEUE(&peer->p_clear_secrets);
 }
 
 static void
@@ -586,7 +582,7 @@ wg_timers_event_any_authenticated_packet_received(struct wg_timers *t)
 }
 
 /* Should be called after a handshake initiation message is sent. */
-void
+static void
 wg_timers_event_handshake_initiated(struct wg_timers *t)
 {
 	callout_reset(&t->t_retry_handshake,
@@ -594,7 +590,7 @@ wg_timers_event_handshake_initiated(struct wg_timers *t)
 	    (timeout_t *)wg_timers_retry_handshake, t);
 }
 
-void
+static void
 wg_timers_event_handshake_responded(struct wg_timers *t)
 {
 	getmicrouptime(&t->t_handshake_touch);
@@ -637,7 +633,7 @@ wg_timers_event_session_derived(struct wg_timers *t)
 	if (!t->t_disabled)
 		callout_reset(&t->t_zero_key_material,
 		    REJECT_AFTER_TIME * 3 * hz,
-		    (timeout_t *)wg_timers_peer_clear_secrets, t);
+		    (timeout_t *)wg_timers_zero_key_material, t);
 	NET_EPOCH_EXIT(et);
 }
 
@@ -762,7 +758,7 @@ wg_queue_len(struct wg_queue *q)
 	return (mbufq_len(&q->q));
 }
 
-int
+static int
 wg_queue_in(struct wg_peer *peer, struct mbuf *m)
 {
 	struct buf_ring *parallel = peer->p_sc->sc_encap_ring;
@@ -1046,8 +1042,8 @@ wg_hashtable_peer_insert(struct wg_hashtable *ht, struct wg_peer *peer)
 	mtx_unlock(&ht->h_mtx);
 }
 
-struct wg_peer *
-wg_hashtable_peer_lookup(struct wg_hashtable *ht,
+static struct wg_peer *
+wg_peer_lookup(struct wg_hashtable *ht,
 			 const uint8_t pubkey[WG_KEY_SIZE])
 {
 	uint64_t key;
@@ -1104,21 +1100,6 @@ wg_cookie_validate_packet(struct cookie_checker *checker, struct mbuf *m,
 
 	return (cookie_checker_validate_macs(checker, macs, data, size,
 	    under_load, &e->e_remote.r_sa));
-}
-
-static void
-wg_cookie_message_consume(struct wg_pkt_cookie *cook, struct wg_softc *sc)
-{
-	struct noise_remote		*remote;
-	struct wg_peer *peer;
-
-	if ((remote = wg_index_get(sc, cook->r_idx)) == NULL) {
-		DPRINTF(sc, "Unknown cookie index\n");
-		return;
-	}
-
-	peer = CONTAINER_OF(remote, struct wg_peer, p_remote);
-	cookie_maker_consume_payload(&peer->p_cookie, cook->nonce, cook->ec);
 }
 
 /* Peer */
@@ -1195,6 +1176,13 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	peer->p_tx_bytes = counter_u64_alloc(M_WAITOK);
 	peer->p_rx_bytes = counter_u64_alloc(M_WAITOK);
 
+	SLIST_INIT(&peer->p_unused_index);
+	SLIST_INSERT_HEAD(&peer->p_unused_index, &peer->p_index[0],
+	    i_unused_entry);
+	SLIST_INSERT_HEAD(&peer->p_unused_index, &peer->p_index[1],
+	    i_unused_entry);
+	SLIST_INSERT_HEAD(&peer->p_unused_index, &peer->p_index[2],
+	    i_unused_entry);
 
 	wg_hashtable_peer_insert(&sc->sc_hashtable, peer);
 	peer->p_sc = sc;
@@ -1279,8 +1267,9 @@ wg_send_initiation(struct wg_peer *peer)
 	pkt.t = le32toh(MESSAGE_HANDSHAKE_INITIATION);
 	cookie_maker_mac(&peer->p_cookie, &pkt.m, &pkt,
 	    sizeof(pkt)-sizeof(pkt.m));
-	wg_peer_send_buf(peer, (uint8_t *)&pkt, sizeof(pkt));
-	wg_timers_event_handshake_initiated(&peer->p_timers);
+	ret = wg_peer_send_buf(peer, (uint8_t *)&pkt, sizeof(pkt));
+	if (ret == 0)
+		wg_timers_event_handshake_initiated(&peer->p_timers);
 out:
 	NET_EPOCH_EXIT(et);
 }
@@ -1303,8 +1292,9 @@ wg_send_response(struct wg_peer *peer)
 	pkt.t = MESSAGE_HANDSHAKE_RESPONSE;
 	cookie_maker_mac(&peer->p_cookie, &pkt.m, &pkt,
 	     sizeof(pkt)-sizeof(pkt.m));
-	wg_peer_send_buf(peer, (uint8_t*)&pkt, sizeof(pkt));
-	wg_timers_event_handshake_responded(&peer->p_timers);
+	ret = wg_peer_send_buf(peer, (uint8_t*)&pkt, sizeof(pkt));
+	if (ret == 0)
+		wg_timers_event_handshake_responded(&peer->p_timers);
 out:
 	NET_EPOCH_EXIT(et);
 	return (ret);
@@ -1354,7 +1344,7 @@ wg_peer_get_endpoint(struct wg_peer *p, struct wg_endpoint *e)
 	memcpy(e, &p->p_endpoint, sizeof(*e));
 }
 
-void
+static void
 wg_deliver_out(struct wg_peer *peer)
 {
 	struct epoch_tracker et;
@@ -1377,7 +1367,6 @@ wg_deliver_out(struct wg_peer *peer)
 		ret = wg_send(&peer->p_sc->sc_socket, &endpoint, t->t_mbuf);
 
 		if (ret == 0) {
-
 			wg_timers_event_any_authenticated_packet_traversal(
 			    &peer->p_timers);
 			wg_timers_event_any_authenticated_packet_sent(
@@ -1394,7 +1383,7 @@ wg_deliver_out(struct wg_peer *peer)
 	NET_EPOCH_EXIT(et);
 }
 
-void
+static void
 wg_deliver_in(struct wg_peer *peer)
 {
 	struct mbuf *m;
@@ -1516,8 +1505,8 @@ verify_endpoint(struct mbuf *m)
 #endif
 }
 
-void
-wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
+static void
+wg_handshake(struct wg_softc *sc, struct mbuf *m)
 {
 	struct wg_pkt_initiation *init;
 	struct wg_pkt_response *resp;
@@ -1532,13 +1521,6 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 	static struct timespec last_under_load;
 	int packet_needs_cookie;
 	int under_load, res;
-
-	if (le32toh(*mtod(m, uint32_t *) )  == MESSAGE_HANDSHAKE_COOKIE) {
-		DPRINTF(sc, "Receiving cookie response\n");
-
-		wg_cookie_message_consume(mtod(m, struct wg_pkt_cookie *), sc);
-		goto free;
-	}
 
 	under_load = mbufq_len(&sc->sc_handshake_queue) >=
 			MAX_QUEUED_INCOMING_HANDSHAKES / 8;
@@ -1602,13 +1584,6 @@ wg_receive_handshake_packet(struct wg_softc *sc, struct mbuf *m)
 		if (noise_remote_begin_session(&peer->p_remote) == 0) {
 			wg_timers_event_session_derived(&peer->p_timers);
 			wg_timers_event_handshake_complete(&peer->p_timers);
-			/* Calling this function will either send any existing
-			 * packets in the queue and not send a keepalive, which
-			 * is the best case, Or, if there's nothing in the
-			 * queue, it will send a keepalive, in order to give
-			 * immediate confirmation of the session.
-			 */
-			wg_send_keepalive(peer);
 		}
 		break;
 	case MESSAGE_HANDSHAKE_COOKIE:
@@ -1771,9 +1746,10 @@ void
 wg_softc_handshake_receive(struct wg_softc *sc)
 {
 	struct mbuf *m;
+
 	while ((m = mbufq_dequeue(&sc->sc_handshake_queue)) != NULL) {
 		verify_endpoint(m);
-		wg_receive_handshake_packet(sc, m);
+		wg_handshake(sc, m);
 	}
 }
 
@@ -1804,19 +1780,16 @@ wg_softc_encrypt(struct wg_softc *sc)
 struct noise_remote *
 wg_remote_get(struct wg_softc *sc, uint8_t public[NOISE_KEY_SIZE])
 {
-#if 0
 	struct wg_peer *peer;
-	if ((peer = wg_peer_lookup(sc, public)) == NULL)
-		return NULL;
-	return &peer->p_remote;
-#endif
-	return NULL;
+
+	if ((peer = wg_peer_lookup(&sc->sc_hashtable, public)) == NULL)
+		return (NULL);
+	return (&peer->p_remote);
 }
 
 uint32_t
 wg_index_set(struct wg_softc *sc, struct noise_remote *remote)
 {
-#if 0
 	struct wg_index *index, *iter;
 	struct wg_peer	*peer;
 	uint32_t	 key;
@@ -1825,12 +1798,12 @@ wg_index_set(struct wg_softc *sc, struct noise_remote *remote)
 	 * guaranteed to be serialised (per remote). */
 	peer = CONTAINER_OF(remote, struct wg_peer, p_remote);
 	index = SLIST_FIRST(&peer->p_unused_index);
-	KASSERT(index != NULL);
+	MPASS(index != NULL);
 	SLIST_REMOVE_HEAD(&peer->p_unused_index, i_unused_entry);
 
 	index->i_value = remote;
 
-	rw_enter_write(&sc->sc_index_lock);
+	rw_wlock(&sc->sc_index_lock);
 assign_id:
 	key = index->i_key = arc4random();
 	key &= sc->sc_index_mask;
@@ -1840,18 +1813,15 @@ assign_id:
 
 	LIST_INSERT_HEAD(&sc->sc_index[key], index, i_entry);
 
-	rw_exit_write(&sc->sc_index_lock);
+	rw_wunlock(&sc->sc_index_lock);
 
 	/* Likewise, no need to lock for index here. */
 	return index->i_key;
-#endif
-	return 0;
 }
 
 struct noise_remote *
 wg_index_get(struct wg_softc *sc, uint32_t key0)
 {
-#if 0
 	struct wg_index		*iter;
 	struct noise_remote	*remote = NULL;
 	uint32_t		 key = key0 & sc->sc_index_mask;
@@ -1864,14 +1834,11 @@ wg_index_get(struct wg_softc *sc, uint32_t key0)
 		}
 	rw_exit_read(&sc->sc_index_lock);
 	return remote;
-#endif
-	return NULL;
 }
 
 void
 wg_index_drop(struct wg_softc *sc, uint32_t key0)
 {
-#if 0
 	struct wg_index	*iter;
 	struct wg_peer	*peer = NULL;
 	uint32_t	 key = key0 & sc->sc_index_mask;
@@ -1886,9 +1853,8 @@ wg_index_drop(struct wg_softc *sc, uint32_t key0)
 
 	/* We expect a peer */
 	peer = CONTAINER_OF(iter->i_value, struct wg_peer, p_remote);
-	KASSERT(peer != NULL);
+	MPASS(peer != NULL);
 	SLIST_INSERT_HEAD(&peer->p_unused_index, iter, i_unused_entry);
-#endif
 }
 
 static void

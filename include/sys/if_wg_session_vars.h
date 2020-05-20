@@ -41,18 +41,12 @@
 #define UNIMPLEMENTED() panic("%s not implemented\n", __func__)
 
 #define WG_KEY_SIZE		 	32
-#define WG_HASH_SIZE			32
-#define WG_XNONCE_SIZE			24
 #define WG_MSG_PADDING_SIZE 		16
-#define WG_TIMESTAMP_SIZE		12
 
 #define WG_PADDING_SIZE(n) ((-(n)) & (WG_MSG_PADDING_SIZE - 1))
 
 /* Constant for session */
-//#define COUNTER_BITS_TOTAL	256
-#define COUNTER_TYPE_BITS	(sizeof(COUNTER_TYPE) * 8)
-#define COUNTER_TYPE_NUM	(COUNTER_BITS_TOTAL / COUNTER_TYPE_BITS)
-#define COUNTER_WINDOW_SIZE	(COUNTER_BITS_TOTAL - COUNTER_TYPE_BITS)
+
 
 #define REKEY_AFTER_MESSAGES		(1ull << 60)
 #define REJECT_AFTER_MESSAGES		(UINT64_MAX - COUNTER_WINDOW_SIZE - 1)
@@ -64,11 +58,8 @@
 #define KEEPALIVE_TIMEOUT		10
 #define MAX_TIMER_HANDSHAKES		(90 / REKEY_TIMEOUT)
 #define NEW_HANDSHAKE_TIMEOUT		(REKEY_TIMEOUT + KEEPALIVE_TIMEOUT)
-//#define COOKIE_SECRET_MAX_AGE		120
-//#define COOKIE_SECRET_LATENCY		5
 
 #define MAX_QUEUED_INCOMING_HANDSHAKES	4096 /* TODO: replace this with DQL */
-#define MAX_STAGED_PACKETS		256
 #define MAX_QUEUED_PACKETS		1024 /* TODO: replace this with DQL */
 
 #define HASHTABLE_PEER_SIZE		(1 << 6)			//1 << 11
@@ -119,6 +110,13 @@ struct wg_queue {
 	struct mbufq			q;
 };
 
+struct wg_index {
+	LIST_ENTRY(wg_index)	 i_entry;
+	SLIST_ENTRY(wg_index)	 i_unused_entry;
+	uint32_t		 i_key;
+	struct noise_remote	*i_value;
+};
+
 struct wg_timers {
 	/* t_lock is for blocking wg_timers_event_* when setting t_disabled. */
 	struct rwlock		 t_lock;
@@ -155,6 +153,9 @@ struct wg_peer {
 	struct wg_endpoint	 p_endpoint;
 
 	uint64_t p_magic_2;
+
+	SLIST_HEAD(,wg_index)	 p_unused_index;
+	struct wg_index		 p_index[3];
 
 	struct wg_queue	 p_encap_queue;
 	struct wg_queue	 p_decap_queue;
@@ -228,19 +229,6 @@ struct wg_route {
 
 /* Noise */
 
-/* Ratelimiter */
-struct wg_ratelimiter;
-
-
-/* Cookie */
-struct wg_cookie_checker {
-	struct mtx	cc_mtx;
-	uint8_t		cc_secret[WG_HASH_SIZE];
-	uint8_t		cc_cookie_key[WG_KEY_SIZE];
-	uint8_t		cc_message_mac1_key[WG_KEY_SIZE];
-	struct timespec cc_secret_birthdate;
-};
-
 /*
  * Peer
  *
@@ -294,6 +282,10 @@ struct wg_softc {
 	struct grouptask		 sc_encrypt;
 	struct grouptask		 sc_decrypt;
 
+	struct rwlock		 sc_index_lock;
+	LIST_HEAD(,wg_index)	*sc_index;
+	u_long			 sc_index_mask;
+
 	struct mtx	sc_mtx;
 };
 
@@ -301,9 +293,6 @@ struct wg_peer *
 	wg_route_lookup(struct wg_route_table *, struct mbuf *,
 				enum route_direction);
 
-struct wg_peer	*
-	wg_peer_ref(struct wg_peer *);
-void	wg_peer_put(struct wg_peer *);
 void	wg_peer_remove_all(struct wg_softc *);
 int	wg_peer_create(struct wg_softc *, struct wg_peer_create_info *);
 

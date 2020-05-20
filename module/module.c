@@ -68,7 +68,7 @@ MALLOC_DEFINE(M_WG, "WG", "wireguard");
 TASKQGROUP_DECLARE(if_io_tqg);
 
 static int clone_count;
-uma_zone_t wg_ratelimit_zone;
+uma_zone_t ratelimit_zone;
 
 static int
 wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t params)
@@ -131,7 +131,7 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	noise_upcall.u_index_drop =
 		(void (*)(void *, uint32_t))wg_index_drop;
 	noise_local_init(local, &noise_upcall);
-	cookie_checker_init(&sc->sc_cookie, wg_ratelimit_zone);
+	cookie_checker_init(&sc->sc_cookie, ratelimit_zone);
 
 	sc->sc_socket.so_port = listen_port;
 	/*
@@ -604,7 +604,8 @@ static if_pseudo_t wg_pseudo;
 int
 wg_ctx_init(void)
 {
-
+	ratelimit_zone = uma_zcreate("wg ratelimit", sizeof(struct ratelimit),
+	     NULL, NULL, NULL, NULL, 0, 0);
 	return (0);
 }
 
