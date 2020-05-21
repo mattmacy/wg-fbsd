@@ -984,13 +984,17 @@ wg_route_lookup(struct wg_route_table *tbl, struct mbuf *m,
 			addr = &ip6hdr->ip6_dst;
 		memcpy(&sin6.sin6_addr, addr, sizeof(sin6.sin6_addr));
 		addr = &sin6;
-	} else
+	} else  {
+		log(LOG_WARNING, "%s bad version %d\n", __func__, version);
+		kdb_backtrace();
 		return (NULL);
-
+	}
 	RADIX_NODE_HEAD_RLOCK(root);
 	if ((node = root->rnh_matchaddr(addr, &root->rh)) != NULL) {
 		peer = ((struct wg_route *) node)->r_peer;
-		peer = peer->p_refcnt ? peer : NULL;
+	} else {
+		log(LOG_WARNING, "matchaddr failed\n");
+		kdb_backtrace();
 	}
 	RADIX_NODE_HEAD_RUNLOCK(root);
 	return (peer);
@@ -1144,7 +1148,6 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	dev = iflib_get_dev(sc->wg_ctx);
 	peer->p_id = atomic_fetchadd_long(&peer_counter, 1);
 
-	refcount_init(&peer->p_refcnt, 0);
 
 	noise_remote_init(&peer->p_remote, __DECONST(uint8_t *, wpci->wpci_pub_key), &sc->sc_local);
 
@@ -1154,6 +1157,7 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 
 	rw_init(&peer->p_endpoint_lock, "wg_peer_endpoint");
 	mtx_init(&peer->p_lock, "peer lock", NULL, MTX_DEF);
+	mtx_init(&peer->p_timers.t_handshake_mtx, "handshake lock", NULL, MTX_DEF);
 	bzero(&peer->p_endpoint, sizeof(peer->p_endpoint));
 	memcpy(&peer->p_endpoint.e_remote, wpci->wpci_endpoint,
 			    sizeof(peer->p_endpoint.e_remote));
@@ -1235,6 +1239,8 @@ wg_peer_free(epoch_context_t ctx)
 
 	DPRINTF(peer->p_sc, "Peer %lu destroyed\n", peer->p_id);
 	mtx_destroy(&peer->p_lock);
+	mtx_destroy(&peer->p_timers.t_handshake_mtx);
+	rw_destroy(&peer->p_endpoint_lock);
 	zfree(peer, M_WG);
 }
 

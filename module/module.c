@@ -151,6 +151,8 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	sc->sc_ifp = iflib_get_ifp(ctx);
 
 	mbufq_init(&sc->sc_handshake_queue, MAX_QUEUED_INCOMING_HANDSHAKES);
+	mtx_init(&sc->sc_mtx, NULL, "wg softc lock",  MTX_DEF);
+	rw_init(&sc->sc_index_lock, "wg index lock");
 	sc->sc_encap_ring = buf_ring_alloc(MAX_QUEUED_PACKETS, M_WG, M_WAITOK, &sc->sc_mtx);
 	sc->sc_decap_ring = buf_ring_alloc(MAX_QUEUED_PACKETS, M_WG, M_WAITOK, &sc->sc_mtx);
 	GROUPTASK_INIT(&sc->sc_handshake, 0,
@@ -198,6 +200,8 @@ wg_transmit(struct ifnet *ifp, struct mbuf *m)
 		goto err;
 	}
 	rc = wg_queue_out(peer, m);
+	if (rc == 0)
+		GROUPTASK_ENQUEUE(&peer->p_sc->sc_encrypt);
 	NET_EPOCH_EXIT(et);
 	return (rc); 
 err:
@@ -232,6 +236,7 @@ wg_attach_post(if_ctx_t ctx)
 	//mtx_init(&sc->wg_socket_lock, "sock lock", NULL, MTX_DEF);
 
 	wg_hashtable_init(&sc->sc_hashtable);
+	sc->sc_index = hashinit(HASHTABLE_INDEX_SIZE, M_DEVBUF, &sc->sc_index_mask);
 	wg_route_init(&sc->sc_routes);
 
 	return (0);
@@ -253,6 +258,8 @@ wg_detach(if_ctx_t ctx)
 	//sc->wg_accept_port = 0;
 	wg_socket_reinit(sc, NULL, NULL);
 	wg_peer_remove_all(sc);
+	mtx_destroy(&sc->sc_mtx);
+	rw_destroy(&sc->sc_index_lock);
 	buf_ring_free(sc->sc_encap_ring, M_WG);
 	buf_ring_free(sc->sc_decap_ring, M_WG);
 

@@ -138,7 +138,6 @@ struct wg_peer {
 	CK_LIST_ENTRY(wg_peer)	 p_entry;
 	uint64_t		 p_id;
 	struct wg_softc		*p_sc;
-	volatile uint32_t		 p_refcnt;
 
 	struct noise_remote	 p_remote;
 	struct cookie_maker	 p_cookie;
@@ -184,23 +183,6 @@ void		 	 wg_queue_deinit(struct wg_queue *);
 /* Counter */
 
 /* Timers */
-#if 0
-struct wg_timers {
-	struct rwlock	t_lock;
-	struct callout	t_retransmit_handshake;
-	struct callout	t_send_keepalive;
-	struct callout	t_new_handshake;
-	struct callout	t_zero_key_material;
-	struct callout	t_persistent_keepalive;
-	uint16_t	t_persistent_keepalive_interval;
-	uint8_t		t_handshake_attempts;
-	bool		t_need_another_keepalive;
-	bool		t_sent_lastminute_handshake;
-
-	struct timeval		 t_handshake_touch;	/* microuptime */
-	struct timespec	t_handshake_complete;
-};
-#endif
 
 /* Route */
 enum route_direction {
