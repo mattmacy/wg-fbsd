@@ -612,7 +612,7 @@ wg_ctx_init(void)
 void
 wg_ctx_uninit(void)
 {
-
+	uma_zdestroy(ratelimit_zone);
 }
 
 static int
