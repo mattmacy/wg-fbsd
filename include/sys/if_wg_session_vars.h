@@ -45,16 +45,11 @@
 
 #define WG_PADDING_SIZE(n) ((-(n)) & (WG_MSG_PADDING_SIZE - 1))
 
+
 /* Constant for session */
-
-
-#define REKEY_AFTER_MESSAGES		(1ull << 60)
-#define REJECT_AFTER_MESSAGES		(UINT64_MAX - COUNTER_WINDOW_SIZE - 1)
 #define REKEY_TIMEOUT			5
 #define REKEY_TIMEOUT_JITTER		500 /* TODO ok? jason */
-#define REKEY_AFTER_TIME		120
 #define REJECT_AFTER_TIME		180
-#define MAX_PEERS_PER_DEVICE		(1u << 20)
 #define KEEPALIVE_TIMEOUT		10
 #define MAX_TIMER_HANDSHAKES		(90 / REKEY_TIMEOUT)
 #define NEW_HANDSHAKE_TIMEOUT		(REKEY_TIMEOUT + KEEPALIVE_TIMEOUT)
@@ -309,8 +304,6 @@ void wg_socket_reinit(struct wg_softc *, struct socket *so4,
 void wg_softc_handshake_receive(struct wg_softc *sc);
 
 void	wg_timers_get_last_handshake(struct wg_timers *, struct timespec *);
-
-void wg_cookie_checker_precompute_device_keys(struct wg_softc *sc);
 
 struct noise_remote *wg_remote_get(struct wg_softc *, uint8_t [NOISE_KEY_SIZE]);
 uint32_t wg_index_set(struct wg_softc *, struct noise_remote *);

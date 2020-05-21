@@ -170,7 +170,6 @@ static int	wg_send_buf(struct wg_socket *, struct wg_endpoint *, uint8_t *, size
 
 
 void	wg_send_keepalive(struct wg_peer *);
-void	wg_peer_flush_staged_packets(struct wg_peer *);
 
 /* Packet */
 static struct wg_endpoint *wg_mbuf_endpoint_get(struct mbuf *);
@@ -1207,8 +1206,6 @@ wg_peer_destroy(struct wg_peer **peer_p)
 	CK_LIST_FOREACH_SAFE(route, &peer->p_routes, r_entry, troute)
 		wg_route_delete(&peer->p_sc->sc_routes, peer, &route->r_cidr);
 	MPASS(CK_LIST_EMPTY(&peer->p_routes));
-
-	wg_peer_flush_staged_packets(peer);
 
 	/* TODO currently, if there is a timer added after here, then the peer
 	 * can hang around for longer than we want. */

@@ -80,6 +80,7 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	nvlist_t *nvl;
 	void *packed;
 	struct noise_local *local;
+	uint8_t			 public[WG_KEY_SIZE];
 	struct noise_upcall	 noise_upcall;
 	int err;
 	uint16_t listen_port;
@@ -139,7 +140,7 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	 */
 
 	noise_local_set_private(local, __DECONST(uint8_t *, key));
-	wg_cookie_checker_precompute_device_keys(sc);
+	cookie_checker_update(&sc->sc_cookie, public);
 	
 	atomic_add_int(&clone_count, 1);
 	scctx = sc->shared = iflib_get_softc_ctx(ctx);
@@ -206,7 +207,6 @@ err:
 	m_free(m);
 	return (rc);
 }
-
 
 static int
 wg_output(struct ifnet *ifp, struct mbuf *m, const struct sockaddr *sa, struct route *rt)
