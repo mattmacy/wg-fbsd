@@ -229,7 +229,7 @@ wg_attach_post(if_ctx_t ctx)
 	if_setmtu(ifp, ETHERMTU - 50);
 	/* XXX do sokect_init */
 
-	if_setflagbits(ifp, 0, IFF_POINTOPOINT);
+	if_setflagbits(ifp, IFF_NOARP, IFF_POINTOPOINT);
 	ifp->if_transmit = wg_transmit;
 	ifp->if_output = wg_output;
 	//CK_LIST_INIT(&sc->wg_peer_list);
