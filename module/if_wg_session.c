@@ -404,6 +404,7 @@ wg_socket_bind(struct wg_softc *sc, struct wg_socket *so)
 	return (rc);
 }
 
+#ifdef notyet
 static int
 wg_send(struct wg_socket *so, struct wg_endpoint *e, struct mbuf *m)
 {
@@ -411,6 +412,8 @@ wg_send(struct wg_socket *so, struct wg_endpoint *e, struct mbuf *m)
 	struct sockaddr *sa;
 	struct mbuf	 *control = NULL;
 	int		 ret;
+
+	printf("wg_send reached\n");
 
 	/* Get local control address before locking */
 	if (e->e_remote.r_sa.sa_family == AF_INET) {
@@ -424,6 +427,7 @@ wg_send(struct wg_socket *so, struct wg_endpoint *e, struct mbuf *m)
 			    sizeof(struct in6_pktinfo), IPV6_PKTINFO,
 			    IPPROTO_IPV6);
 	} else {
+		printf("bad family\n");
 		return EAFNOSUPPORT;
 	}
 
@@ -441,7 +445,201 @@ wg_send(struct wg_socket *so, struct wg_endpoint *e, struct mbuf *m)
 		m_freem(m);
 	}
 	NET_EPOCH_EXIT(et);
+	if (ret)
+		printf("bad sosend %d\n", ret);
 	return (ret);
+}
+#endif
+
+static int
+wg_laddr_v4(struct inpcb *inp, struct in_addr *laddr4, struct wg_endpoint *e)
+{
+	int err;
+
+	if (e->e_local.l_in.s_addr == INADDR_ANY) {
+			CURVNET_SET(inp->inp_vnet);
+			err = in_pcbladdr(inp, &e->e_remote.r_sin.sin_addr, laddr4, curthread->td_ucred);
+			CURVNET_RESTORE();
+			if (err != 0) {
+				printf("in_pcbladdr() -> %d\n", err);
+				return err;
+			}
+			e->e_local.l_in = *laddr4;
+		}
+		return (0);
+}
+
+static int
+wg_laddr_v6(struct inpcb *inp, struct in6_addr *laddr6, struct wg_endpoint *e)
+{
+	int err;
+
+		if (IN6_IS_ADDR_UNSPECIFIED(&e->e_local.l_in6)) {
+			err = in6_selectsrc_addr(0, &e->e_remote.r_sin6.sin6_addr, 0,
+									 NULL, laddr6, NULL);
+			if (err != 0)
+				return err;
+			e->e_local.l_in6 = *laddr6;
+		}
+		return (0);
+}
+
+static int
+wg_mbuf_add_ipudp(struct wg_socket *so, struct wg_endpoint *e, struct mbuf **m0)
+{
+	struct mbuf *m = *m0;
+	int err, len = m->m_pkthdr.len;
+	struct inpcb *inp;
+	struct thread *td;
+
+	struct ip *ip4;
+	struct ip6_hdr *ip6;
+	struct udphdr *udp;
+
+	struct in_addr laddr4;
+	struct in6_addr laddr6;
+	in_port_t rport;
+	uint8_t  pr;
+
+	MPASS(len > 0);
+	MPASS(m->m_len > 0);
+	td = curthread;
+	if (e->e_remote.r_sa.sa_family == AF_INET) {
+		int size = sizeof(*ip4) + sizeof(*udp);
+		m = m_prepend(m, size, M_WAITOK);
+		bzero(m->m_data, size);
+		m->m_pkthdr.flowid = AF_INET;
+		inp = sotoinpcb(so->so_so4);
+
+		ip4 = mtod(m, struct ip *);
+		ip4->ip_v	= IPVERSION;
+		ip4->ip_hl	= sizeof(*ip4) >> 2;
+		// XXX
+		// ip4->ip_tos	= inp->inp_ip.ip_tos; /* TODO ECN */
+		ip4->ip_len	= htons(sizeof(*ip4) + sizeof(*udp) + len);
+		//ip4->ip_id	= htons(ip_randomid());
+		ip4->ip_off	= 0;
+		ip4->ip_ttl	= 127;
+		ip4->ip_p	= IPPROTO_UDP;
+
+		if ((err = wg_laddr_v4(inp, &laddr4, e)))
+			return (err);
+
+		ip4->ip_src	= e->e_local.l_in;
+		ip4->ip_dst	= e->e_remote.r_sin.sin_addr;
+		rport		= e->e_remote.r_sin.sin_port;
+
+		udp = (struct udphdr *)(mtod(m, caddr_t) + sizeof(*ip4));
+		udp->uh_dport = rport;
+		udp->uh_ulen = htons(sizeof(*udp) + len);
+		udp->uh_sport = htons(so->so_port);
+		pr  = inp->inp_socket->so_proto->pr_protocol;
+		udp->uh_sum =  in_pseudo(ip4->ip_src.s_addr, ip4->ip_dst.s_addr,
+		    htons((u_short)len + sizeof(struct udphdr) + pr));
+	} else if (e->e_remote.r_sa.sa_family == AF_INET6) {
+		m = m_prepend(m, sizeof(*ip6) + sizeof(*udp), M_WAITOK);
+		m->m_pkthdr.flowid = AF_INET;
+
+		inp = sotoinpcb(so->so_so6);
+
+		ip6 = mtod(m, struct ip6_hdr *);
+		/* TODO ECN */
+		//ip6->ip6_flow	 = inp->inp_flowinfo & IPV6_FLOWINFO_MASK;
+		ip6->ip6_vfc	&= ~IPV6_VERSION_MASK;
+		ip6->ip6_vfc	|= IPV6_VERSION;
+#if 0	/* ip6_plen will be filled in ip6_output. */
+		ip6->ip6_plen	 = htons(XXX);
+#endif
+		ip6->ip6_nxt	 = IPPROTO_UDP;
+		ip6->ip6_hlim	 = in6_selecthlim(inp, NULL);
+
+		if ((err = wg_laddr_v6(inp, &laddr6, e)))
+			return (err);
+
+		ip6->ip6_src	 = e->e_local.l_in6;
+		/* ip6->ip6_dst	 = e->e_remote.r_sin6.sin6_addr; */
+		rport		 = e->e_remote.r_sin6.sin6_port;
+
+		if (sa6_embedscope(&e->e_remote.r_sin6, 0) != 0)
+			return ENXIO;
+
+		udp = (struct udphdr *)(mtod(m, caddr_t) + sizeof(*ip6));
+
+	} else {
+		kdb_backtrace();
+		printf("%s bad family\n", __func__);
+		return EAFNOSUPPORT;
+	}
+
+	m->m_flags &= ~(M_BCAST|M_MCAST);
+	m->m_pkthdr.csum_flags = CSUM_UDP | CSUM_UDP_IPV6;
+	m->m_pkthdr.csum_data = offsetof(struct udphdr, uh_sum);
+	printf("add ipudp success\n");
+	*m0 = m;
+
+	return 0;
+}
+
+static int
+wg_socket_send_mbuf(struct wg_socket *so, struct mbuf *m, uint16_t family)
+{
+	int err, size;
+	struct inpcb *inp;
+	struct mbuf *mp;
+
+	err = 0;
+	switch (family) {
+		case AF_INET: {
+			size = sizeof(struct ip) + sizeof(struct udphdr);
+			inp = sotoinpcb(so->so_so4);
+			break;
+		}
+		case AF_INET6: {
+			size = sizeof(struct ip6_hdr) + sizeof(struct udphdr);
+			inp = sotoinpcb(so->so_so6);
+			break;
+		}
+	default:
+		m_freem(m);
+		err = EAFNOSUPPORT;
+	}
+	if (err)
+		return (err);
+	if (m->m_len == 0) {
+		if ((mp = m_pullup(m, size)) == NULL)
+			return (ENOMEM);
+	}
+
+	CURVNET_SET(inp->inp_vnet);
+	switch (family) {
+		case AF_INET: {
+			err = ip_output(m, NULL, NULL, IP_RAWOUTPUT, NULL, NULL);
+			break;
+		}
+		case AF_INET6: {
+			err = ip6_output(m, NULL, NULL, IPV6_MINMTU, NULL, NULL, NULL);
+			break;
+		}
+	}
+	if (err)
+		log(LOG_WARNING, "ip_output()->%d\n", err);
+	CURVNET_RESTORE();
+	return (err);
+}
+
+static int
+wg_send(struct wg_socket *so, struct wg_endpoint *e, struct mbuf *m)
+{
+	int rc;
+
+	printf("reached wg_send\n");
+	if ((rc = wg_mbuf_add_ipudp(so, e, &m))) {
+		printf("add ipudp fail %d\n", rc);
+		return (rc);
+	}
+	rc = wg_socket_send_mbuf(so, m, e->e_remote.r_sa.sa_family);
+	printf("wg_socket_send_mbuf returned %d\n", rc);
+	return (rc);
 }
 
 /* Timers */
