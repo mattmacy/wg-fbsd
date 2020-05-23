@@ -140,6 +140,7 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	 */
 
 	noise_local_set_private(local, __DECONST(uint8_t *, key));
+	noise_local_keys(local, public, NULL);
 	cookie_checker_update(&sc->sc_cookie, public);
 	
 	atomic_add_int(&clone_count, 1);
