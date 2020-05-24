@@ -64,7 +64,6 @@
 #define MAX_STAGED_PKT		128
 #define MAX_QUEUED_PKT		512
 
-
 #define	GROUPTASK_DRAIN(gtask)			\
 	gtaskqueue_drain((gtask)->gt_taskqueue, &(gtask)->gt_task)
 TASKQGROUP_DECLARE(if_io_tqg);
@@ -413,49 +412,7 @@ wg_socket_bind(struct wg_softc *sc, struct wg_socket *so)
 	return (rc);
 }
 
-static int
-wg_send(struct wg_socket *so, struct wg_endpoint *e, struct mbuf *m)
-{
-	struct epoch_tracker et;
-	struct sockaddr *sa;
-	struct mbuf	 *control = NULL;
-	int		 ret;
-
-	/* Get local control address before locking */
-	if (e->e_remote.r_sa.sa_family == AF_INET) {
-		if (e->e_local.l_in.s_addr != INADDR_ANY)
-			control = sbcreatecontrol((caddr_t)&e->e_local.l_in,
-			    sizeof(struct in_addr), IP_SENDSRCADDR,
-			    IPPROTO_IP);
-	} else if (e->e_remote.r_sa.sa_family == AF_INET6) {
-		if (!IN6_IS_ADDR_UNSPECIFIED(&e->e_local.l_in6))
-			control = sbcreatecontrol((caddr_t)&e->e_local.l_pktinfo6,
-			    sizeof(struct in6_pktinfo), IPV6_PKTINFO,
-			    IPPROTO_IPV6);
-	} else {
-		printf("bad family\n");
-		return EAFNOSUPPORT;
-	}
-
-	/* Get remote address */
-	sa = &e->e_remote.r_sa;
-
-	NET_EPOCH_ENTER(et);
-	if (e->e_remote.r_sa.sa_family == AF_INET && so->so_so4 != NULL)
-		ret = sosend(so->so_so4, sa, NULL, m, control, 0, curthread);
-	else if (e->e_remote.r_sa.sa_family == AF_INET6 && so->so_so6 != NULL)
-		ret = sosend(so->so_so6, sa, NULL, m, control, 0, curthread);
-	else {
-		ret = ENOTCONN;
-		wg_m_freem(control);
-		wg_m_freem(m);
-	}
-	NET_EPOCH_EXIT(et);
-	printf("sosend->%d\n", ret);
-	return (ret);
-}
-
-#ifdef legacy
+#ifdef USE_LEGACY
 static int
 wg_laddr_v4(struct inpcb *inp, struct in_addr *laddr4, struct wg_endpoint *e)
 {
@@ -506,8 +463,6 @@ wg_mbuf_add_ipudp(struct wg_socket *so, struct wg_endpoint *e, struct mbuf **m0)
 	in_port_t rport;
 	uint8_t  pr;
 
-	MPASS(len > 0);
-	MPASS(m->m_len > 0);
 	td = curthread;
 	if (e->e_remote.r_sa.sa_family == AF_INET) {
 		int size = sizeof(*ip4) + sizeof(*udp);
@@ -571,15 +526,12 @@ wg_mbuf_add_ipudp(struct wg_socket *so, struct wg_endpoint *e, struct mbuf **m0)
 		udp = (struct udphdr *)(mtod(m, caddr_t) + sizeof(*ip6));
 
 	} else {
-		kdb_backtrace();
-		printf("%s bad family\n", __func__);
 		return EAFNOSUPPORT;
 	}
 
 	m->m_flags &= ~(M_BCAST|M_MCAST);
 	m->m_pkthdr.csum_flags = CSUM_UDP | CSUM_UDP_IPV6;
 	m->m_pkthdr.csum_data = offsetof(struct udphdr, uh_sum);
-	printf("add ipudp success\n");
 	*m0 = m;
 
 	return 0;
@@ -637,7 +589,6 @@ wg_send(struct wg_socket *so, struct wg_endpoint *e, struct mbuf *m)
 {
 	int rc;
 
-	printf("reached wg_send\n");
 	if ((rc = wg_mbuf_add_ipudp(so, e, &m))) {
 		printf("add ipudp fail %d\n", rc);
 		return (rc);
@@ -645,6 +596,48 @@ wg_send(struct wg_socket *so, struct wg_endpoint *e, struct mbuf *m)
 	rc = wg_socket_send_mbuf(so, m, e->e_remote.r_sa.sa_family);
 	printf("wg_socket_send_mbuf returned %d\n", rc);
 	return (rc);
+}
+#else
+static int
+wg_send(struct wg_socket *so, struct wg_endpoint *e, struct mbuf *m)
+{
+	struct epoch_tracker et;
+	struct sockaddr *sa;
+	struct mbuf	 *control = NULL;
+	int		 ret;
+
+	/* Get local control address before locking */
+	if (e->e_remote.r_sa.sa_family == AF_INET) {
+		if (e->e_local.l_in.s_addr != INADDR_ANY)
+			control = sbcreatecontrol((caddr_t)&e->e_local.l_in,
+			    sizeof(struct in_addr), IP_SENDSRCADDR,
+			    IPPROTO_IP);
+	} else if (e->e_remote.r_sa.sa_family == AF_INET6) {
+		if (!IN6_IS_ADDR_UNSPECIFIED(&e->e_local.l_in6))
+			control = sbcreatecontrol((caddr_t)&e->e_local.l_pktinfo6,
+			    sizeof(struct in6_pktinfo), IPV6_PKTINFO,
+			    IPPROTO_IPV6);
+	} else {
+		return EAFNOSUPPORT;
+	}
+
+	/* Get remote address */
+	sa = &e->e_remote.r_sa;
+
+	NET_EPOCH_ENTER(et);
+	if (e->e_remote.r_sa.sa_family == AF_INET && so->so_so4 != NULL)
+		ret = sosend(so->so_so4, sa, NULL, m, control, 0, curthread);
+	else if (e->e_remote.r_sa.sa_family == AF_INET6 && so->so_so6 != NULL)
+		ret = sosend(so->so_so6, sa, NULL, m, control, 0, curthread);
+	else {
+		ret = ENOTCONN;
+		wg_m_freem(control);
+		wg_m_freem(m);
+	}
+	NET_EPOCH_EXIT(et);
+	if (ret)
+		printf("sosend->%d\n", ret);
+	return (ret);
 }
 #endif
 
@@ -966,8 +959,8 @@ wg_queue_len(struct wg_queue *q)
 static int
 wg_queue_in(struct wg_peer *peer, struct mbuf *m)
 {
-	struct buf_ring *parallel = peer->p_sc->sc_encap_ring;
-	struct wg_queue		*serial = &peer->p_encap_queue;
+	struct buf_ring *parallel = peer->p_sc->sc_decap_ring;
+	struct wg_queue		*serial = &peer->p_decap_queue;
 	struct wg_tag		*t;
 	int rc;
 
@@ -1194,7 +1187,6 @@ wg_route_lookup(struct wg_route_table *tbl, struct mbuf *m,
 		addr = &sin6;
 	} else  {
 		log(LOG_WARNING, "%s bad version %d\n", __func__, version);
-		kdb_backtrace();
 		return (NULL);
 	}
 	RADIX_NODE_HEAD_RLOCK(root);
@@ -1202,7 +1194,6 @@ wg_route_lookup(struct wg_route_table *tbl, struct mbuf *m,
 		peer = ((struct wg_route *) node)->r_peer;
 	} else {
 		log(LOG_WARNING, "matchaddr failed\n");
-		kdb_backtrace();
 	}
 	RADIX_NODE_HEAD_RUNLOCK(root);
 	return (peer);
@@ -1571,11 +1562,12 @@ wg_deliver_out(struct wg_peer *peer)
 	while ((m = wg_queue_dequeue(&peer->p_encap_queue, &t)) != NULL) {
 		/* t_mbuf will contain the encrypted packet */
 		if (t->t_mbuf == NULL){
+			printf("packet not encrypted\n");
 			if_inc_counter(peer->p_sc->sc_ifp, IFCOUNTER_OERRORS, 1);
 			wg_m_freem(m);
 			continue;
 		}
-
+		M_MOVE_PKTHDR(t->t_mbuf, m);
 		ret = wg_send(&peer->p_sc->sc_socket, &endpoint, t->t_mbuf);
 
 		if (ret == 0) {
@@ -1699,7 +1691,7 @@ send:
 	if (noise_remote_ready(&peer->p_remote) == 0) {
 		if (m != NULL)
 			wg_queue_out(peer, m);
-			GROUPTASK_ENQUEUE(&peer->p_sc->sc_encrypt);
+		GROUPTASK_ENQUEUE(&peer->p_sc->sc_encrypt);
 	} else {
 		wg_timers_event_want_initiation(&peer->p_timers);
 	}
@@ -1756,7 +1748,6 @@ wg_handshake(struct wg_softc *sc, struct mbuf *m)
 		init = mtod(m, struct wg_pkt_initiation *);
 
 		if (packet_needs_cookie) {
-			printf("sending cookie\n");
 			wg_send_cookie(sc, &init->m, init->init.s_idx, m);
 			return;
 		}
@@ -1777,7 +1768,6 @@ wg_handshake(struct wg_softc *sc, struct mbuf *m)
 		resp = mtod(m, struct wg_pkt_response *);
 
 		if (packet_needs_cookie) {
-			printf("sending cookie\n");
 			wg_send_cookie(sc, &resp->m, resp->resp.s_idx, m);
 			return;
 		}
@@ -1877,8 +1867,11 @@ wg_encap(struct wg_softc *sc, struct mbuf *m)
 	if (m->m_pkthdr.len == 0)
 		DPRINTF(sc, "Sending keepalive packet to peer %lu\n",
 		    peer->p_id);
-
-	M_MOVE_PKTHDR(mc, m);
+	/*
+	 * Set the correct output value here since it will be copied
+	 * when we move the pkthdr in send.
+	 */
+	m->m_pkthdr.len = out_len;
 	mc->m_flags &= ~(M_MCAST | M_BCAST);
 	mc->m_len = out_len;
 	m_calchdrlen(mc);
@@ -1911,6 +1904,7 @@ wg_decap(struct wg_softc *sc, struct mbuf *m)
 
 	res = noise_remote_decrypt(&peer->p_remote, &data->data, plaintext_len);
 	if (__predict_false(res)) {
+		printf("noise_remote_decrypt fail %d \n", res);
 		if (res == EINVAL) {
 			goto error;
 		} else if (res == ECONNRESET) {
@@ -1921,14 +1915,12 @@ wg_decap(struct wg_softc *sc, struct mbuf *m)
 			panic("unexpected response: %d\n", res);
 		}
 	}
-
 	wg_peer_set_endpoint_from_tag(peer, t);
 	counter_u64_add(peer->p_rx_bytes, m->m_pkthdr.len);
 
 	/* Remove the data header, and crypto mac tail from the packet */
 	m_adj(m, sizeof(struct wg_pkt_data));
 	m_adj(m, -NOISE_MAC_SIZE);
-
 
 	/* A packet with length 0 is a keepalive packet */
 	if (m->m_pkthdr.len == 0) {
@@ -2067,6 +2059,9 @@ wg_index_drop(struct wg_softc *sc, uint32_t key0)
 		}
 	rw_exit_write(&sc->sc_index_lock);
 
+	if (iter == NULL)
+		return;
+
 	/* We expect a peer */
 	peer = CONTAINER_OF(iter->i_value, struct wg_peer, p_remote);
 	MPASS(peer != NULL);
@@ -2087,7 +2082,6 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 	struct wg_tag *t;
 	void *data;
 
-	DPRINTF(sc, "wg_input reached\n");
 	uh = (struct udphdr *)(m0->m_data + offset);
 	hlen = offset + sizeof(struct udphdr);
 
@@ -2129,9 +2123,11 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 		pkt_data = data;
 		remote = wg_index_get(sc, pkt_data->data.r_idx);
 		if (remote == NULL) {
+			DPRINTF(sc, "no remote\n");
 			if_inc_counter(sc->sc_ifp, IFCOUNTER_IERRORS, 1);
 			wg_m_freem(m);
 		} else if (buf_ring_count(sc->sc_decap_ring) > MAX_QUEUED_PACKETS) {
+			DPRINTF(sc, "freeing excess packet on input\n");
 			if_inc_counter(sc->sc_ifp, IFCOUNTER_IQDROPS, 1);
 			wg_m_freem(m);
 		} else {
@@ -2139,7 +2135,6 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 			    p_remote);
 			t->t_mbuf = NULL;
 			t->t_done = 0;
-
 			wg_queue_in(t->t_peer, m);
 			GROUPTASK_ENQUEUE(&sc->sc_decrypt);
 		}
