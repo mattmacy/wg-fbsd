@@ -40,6 +40,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/socket.h>
 #include <sys/sockio.h>
 #include <sys/queue.h>
+#include <sys/smp.h>
 
 
 #include <net/if.h>
@@ -69,6 +70,55 @@ TASKQGROUP_DECLARE(if_io_tqg);
 
 static int clone_count;
 uma_zone_t ratelimit_zone;
+
+void
+wg_encrypt_dispatch(struct wg_softc *sc)
+{
+	for (int i = 0; i < mp_ncpus; i++) {
+		if (sc->sc_encrypt[i].gt_task.ta_flags & TASK_ENQUEUED)
+			continue;
+		GROUPTASK_ENQUEUE(&sc->sc_encrypt[i]);
+	}
+}
+
+void
+wg_decrypt_dispatch(struct wg_softc *sc)
+{
+	for (int i = 0; i < mp_ncpus; i++) {
+		if (sc->sc_decrypt[i].gt_task.ta_flags & TASK_ENQUEUED)
+			continue;
+		GROUPTASK_ENQUEUE(&sc->sc_decrypt[i]);
+	}
+}
+
+static void
+crypto_taskq_setup(struct wg_softc *sc)
+{
+	device_t dev = iflib_get_dev(sc->wg_ctx);
+
+	sc->sc_encrypt = malloc(sizeof(struct grouptask)*mp_ncpus, M_WG, M_WAITOK);
+	sc->sc_decrypt = malloc(sizeof(struct grouptask)*mp_ncpus, M_WG, M_WAITOK);
+
+	for (int i = 0; i < mp_ncpus; i++) {
+		GROUPTASK_INIT(&sc->sc_encrypt[i], 0,
+		     (gtask_fn_t *)wg_softc_encrypt, sc);
+		taskqgroup_attach_cpu(qgroup_if_io_tqg, &sc->sc_encrypt[i], sc,  i, dev, NULL, "wg encrypt");
+		GROUPTASK_INIT(&sc->sc_decrypt[i], 0,
+		    (gtask_fn_t *)wg_softc_decrypt, sc);
+		taskqgroup_attach_cpu(qgroup_if_io_tqg, &sc->sc_decrypt[i], sc, i, dev, NULL, "wg decrypt");
+	}
+}
+
+static void
+crypto_taskq_destroy(struct wg_softc *sc)
+{
+	for (int i = 0; i < mp_ncpus; i++) {
+		taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_encrypt[i]);
+		taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_decrypt[i]);
+	}
+	free(sc->sc_encrypt, M_WG);
+	free(sc->sc_decrypt, M_WG);
+}
 
 static int
 wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t params)
@@ -159,12 +209,7 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	GROUPTASK_INIT(&sc->sc_handshake, 0,
 	    (gtask_fn_t *)wg_softc_handshake_receive, sc);
 	taskqgroup_attach(qgroup_if_io_tqg, &sc->sc_handshake, sc, dev, NULL, "wg tx initiation");
-	GROUPTASK_INIT(&sc->sc_encrypt, 0,
-	    (gtask_fn_t *)wg_softc_encrypt, sc);
-	taskqgroup_attach(qgroup_if_io_tqg, &sc->sc_encrypt, sc, dev, NULL, "wg encrypt");
-	GROUPTASK_INIT(&sc->sc_decrypt, 0,
-	    (gtask_fn_t *)wg_softc_decrypt, sc);
-	taskqgroup_attach(qgroup_if_io_tqg, &sc->sc_decrypt, sc, dev, NULL, "wg decrypt");
+	crypto_taskq_setup(sc);
  nvl_out:
 	nvlist_destroy(nvl);
 out:
@@ -189,7 +234,7 @@ wg_transmit(struct ifnet *ifp, struct mbuf *m)
 	peer = wg_route_lookup(&sc->sc_routes, m, OUT);
 	if (__predict_false(peer == NULL)) {
 		rc = ENOKEY;
-		printf("peer not found\n");
+		printf("peer not found - dropping %p\n", m);
 		/* XXX log */
 		goto err;
 	}
@@ -202,7 +247,7 @@ wg_transmit(struct ifnet *ifp, struct mbuf *m)
 	}
 	rc = wg_queue_out(peer, m);
 	if (rc == 0)
-		GROUPTASK_ENQUEUE(&peer->p_sc->sc_encrypt);
+		wg_encrypt_dispatch(peer->p_sc);
 	NET_EPOCH_EXIT(et);
 	return (rc); 
 err:
@@ -265,9 +310,7 @@ wg_detach(if_ctx_t ctx)
 	buf_ring_free(sc->sc_decap_ring, M_WG);
 
 	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_handshake);
-	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_encrypt);
-	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_decrypt);
-
+	crypto_taskq_destroy(sc);
 	atomic_add_int(&clone_count, -1);
 
 	return (0);

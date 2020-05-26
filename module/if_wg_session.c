@@ -1691,7 +1691,7 @@ send:
 	if (noise_remote_ready(&peer->p_remote) == 0) {
 		if (m != NULL)
 			wg_queue_out(peer, m);
-		GROUPTASK_ENQUEUE(&peer->p_sc->sc_encrypt);
+		wg_encrypt_dispatch(peer->p_sc);
 	} else {
 		wg_timers_event_want_initiation(&peer->p_timers);
 	}
@@ -2136,7 +2136,7 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 			t->t_mbuf = NULL;
 			t->t_done = 0;
 			wg_queue_in(t->t_peer, m);
-			GROUPTASK_ENQUEUE(&sc->sc_decrypt);
+			wg_decrypt_dispatch(sc);
 		}
 	} else {
 		DPRINTF(sc, "Invalid packet\n");
