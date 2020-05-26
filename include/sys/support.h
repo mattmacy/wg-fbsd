@@ -1,6 +1,6 @@
 #ifndef SYS_SUPPORT_H_
 #define SYS_SUPPORT_H_
-
+#ifndef __LOCORE
 #include <sys/types.h>
 #include <sys/limits.h>
 #include <sys/endian.h>
@@ -301,4 +301,5 @@ SYSUNINIT(zfs_ ## fn, SI_SUB_LAST, SI_ORDER_FIRST, wrap_ ## fn, NULL)
 #define kfree(p) free(p, M_WG)
 #define vzalloc(size) malloc((size), M_WG, M_WAITOK|M_ZERO)
 #define vfree(p) free(p, M_WG)
+#endif
 #endif
