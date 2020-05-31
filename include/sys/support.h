@@ -105,7 +105,6 @@ put_unaligned_le32(u32 val, void *p)
 
 #define	kfpu_begin(ctx) {							\
 		if (ctx->sc_fpu_ctx == NULL)	 {			 \
-			printf("allocate fpu ctx\n");			 \
 			ctx->sc_fpu_ctx = fpu_kern_alloc_ctx(0); \
 		}														 \
 		critical_enter();										 \
@@ -153,33 +152,22 @@ simd_put(simd_context_t *ctx)
 {
 	if (is_fpu_kern_thread(0))
 		return;
-	if (ctx->sc_state & HAVE_SIMD_IN_USE) {
-		printf("exit SIMD\n");
+	if (ctx->sc_state & HAVE_SIMD_IN_USE)
 		kfpu_end(ctx);
-	}
 	ctx->sc_state = HAVE_NO_SIMD;
 }
 
 static __must_check inline bool
 simd_use(simd_context_t *ctx)
 {
-	if (is_fpu_kern_thread(0)) {
-		printf("is fpu kern thread \n");
+	if (is_fpu_kern_thread(0))
 		return true;
-	}
-	if (ctx == NULL) {
-		printf("NULL context \n");
-
+	if (ctx == NULL)
 		return false;
-	}
-	if (!(ctx->sc_state & HAVE_FULL_SIMD)) {
-		printf("don't have SIMD \n");
+	if (!(ctx->sc_state & HAVE_FULL_SIMD))
 		return false;
-	}
-	if (ctx->sc_state & HAVE_SIMD_IN_USE) {
-		printf("SIMD in use\n");
+	if (ctx->sc_state & HAVE_SIMD_IN_USE)
 		return true;
-	}
 	kfpu_begin(ctx);
 	ctx->sc_state |= HAVE_SIMD_IN_USE;
 	return true;

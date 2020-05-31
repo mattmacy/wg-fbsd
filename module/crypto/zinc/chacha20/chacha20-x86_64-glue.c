@@ -82,10 +82,15 @@ static inline bool chacha20_arch(struct chacha20_ctx *ctx, u8 *dst,
 	BUILD_BUG_ON(PAGE_SIZE < CHACHA20_BLOCK_SIZE ||
 		     PAGE_SIZE % CHACHA20_BLOCK_SIZE);
 
-	if ( !chacha20_use_ssse3 ||
-	    len <= CHACHA20_BLOCK_SIZE || !simd_use(simd_context))
+	if (!chacha20_use_ssse3) {
 		return false;
-
+	}
+	if (len <= CHACHA20_BLOCK_SIZE) {
+		return false;
+	}
+	if  (!simd_use(simd_context)) {
+		return false;
+	}
 	for (;;) {
 		const size_t bytes = min_t(size_t, len, PAGE_SIZE);
 
