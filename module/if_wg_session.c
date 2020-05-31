@@ -1683,9 +1683,9 @@ wg_send_keepalive(struct wg_peer *peer)
 	t->t_mtu = 0; /* MTU == 0 OK for keepalive */
 send:
 	NET_EPOCH_ENTER(et);
+	if (m != NULL)
+		wg_queue_out(peer, m);
 	if (noise_remote_ready(&peer->p_remote) == 0) {
-		if (m != NULL)
-			wg_queue_out(peer, m);
 		wg_encrypt_dispatch(peer->p_sc);
 	} else {
 		wg_timers_event_want_initiation(&peer->p_timers);
