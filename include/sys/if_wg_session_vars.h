@@ -126,9 +126,9 @@ struct wg_timers {
 	struct callout		 t_persistent_keepalive;
 
 	struct mtx		 t_handshake_mtx;
-	struct timeval		 t_handshake_touch;	/* microuptime */
-	struct timespec		 t_handshake_complete;	/* nanotime */
-	int			 t_handshake_retries;
+	struct timespec		 t_handshake_last_sent;
+	struct timespec		 t_handshake_complete;
+	volatile int		 t_handshake_retries;
 
 };
 

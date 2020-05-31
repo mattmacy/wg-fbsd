@@ -110,6 +110,9 @@ static int	wg_socket_bind(struct wg_softc *sc, struct wg_socket *);
 static int	wg_send(struct wg_socket *, struct wg_endpoint *, struct mbuf *);
 
 /* Timers */
+static int	wg_timers_expired_handshake_last_sent(struct wg_timers *);
+
+
 static void	wg_timers_event_data_sent(struct wg_timers *);
 static void	wg_timers_event_data_received(struct wg_timers *);
 static void	wg_timers_event_any_authenticated_packet_sent(struct wg_timers *);
@@ -121,15 +124,15 @@ static void	wg_timers_event_session_derived(struct wg_timers *);
 static void	wg_timers_event_any_authenticated_packet_traversal(struct wg_timers *);
 static void	wg_timers_event_want_initiation(struct wg_timers *);
 
-static void	wg_timers_run_new_handshake(struct wg_timers *);
-static void	wg_timers_run_send_keepalive(struct wg_timers *);
+static void	wg_timers_run_send_initiation(struct wg_timers *, int);
 static void	wg_timers_run_retry_handshake(struct wg_timers *);
+static void	wg_timers_run_send_keepalive(struct wg_timers *);
+static void	wg_timers_run_new_handshake(struct wg_timers *);
 static void	wg_timers_run_zero_key_material(struct wg_timers *);
 static void	wg_timers_run_persistent_keepalive(struct wg_timers *);
 
 static void	wg_peer_timers_init(struct wg_peer *);
 static void	wg_timers_disable(struct wg_timers *);
-int	wg_timers_expired(struct timespec *, time_t, long);
 
 /* Queue */
 static int	wg_queue_in(struct wg_peer *, struct mbuf *);
@@ -184,8 +187,10 @@ static void wg_input(struct mbuf *m, int offset, struct inpcb *inpcb,
 
 /* Globals */
 
+#define UNDERLOAD_TIMEOUT	1
+
 static volatile unsigned long peer_counter = 0;
-static struct timeval	rekey_interval = { REKEY_TIMEOUT, 0 };
+static struct timeval	underload_interval = { UNDERLOAD_TIMEOUT, 0 };
 
 #define M_ENQUEUED	M_PROTO1
 
@@ -642,90 +647,9 @@ wg_send(struct wg_socket *so, struct wg_endpoint *e, struct mbuf *m)
 }
 #endif
 
+
+
 /* Timers */
-void
-wg_timers_run_retry_handshake(struct wg_timers *t)
-{
-	struct wg_peer	*peer = CONTAINER_OF(t, struct wg_peer, p_timers);
-	int		 retries, ready = 0;
-
-	mtx_lock(&t->t_handshake_mtx);
-	if (ratecheck(&t->t_handshake_touch, &rekey_interval)) {
-		retries = ++t->t_handshake_retries;
-		ready = 1;
-	}
-	mtx_unlock(&t->t_handshake_mtx);
-	if (!ready)
-		return;
-
-	if (retries < MAX_TIMER_HANDSHAKES) {
-		wg_peer_clear_src(peer);
-		GROUPTASK_ENQUEUE(&peer->p_send_initiation);
-	} else {
-		GROUPTASK_ENQUEUE(&peer->p_send_initiation);
-		callout_del(&t->t_send_keepalive);
-		if (!callout_pending(&t->t_zero_key_material))
-			callout_reset(&t->t_zero_key_material, REJECT_AFTER_TIME * 3 * hz,
-			    (timeout_t *)wg_timers_run_zero_key_material, t);
-	}
-}
-
-static void
-wg_timers_run_send_keepalive(struct wg_timers *t)
-{
-	struct wg_peer	*peer = CONTAINER_OF(t, struct wg_peer, p_timers);
-
-	GROUPTASK_ENQUEUE(&peer->p_send_keepalive);
-	if (t->t_need_another_keepalive) {
-		t->t_need_another_keepalive = 0;
-		callout_reset(&t->t_send_keepalive,
-		    KEEPALIVE_TIMEOUT*hz,
-		     (timeout_t *)wg_timers_run_send_keepalive, peer);
-	}
-}
-
-static void
-wg_timers_run_new_handshake(struct wg_timers *t)
-{
-	struct wg_peer	*peer = CONTAINER_OF(t, struct wg_peer, p_timers);
-	int		 ready = 0;
-
-	mtx_lock(&t->t_handshake_mtx);
-	if (ratecheck(&t->t_handshake_touch, &rekey_interval)) {
-		t->t_handshake_retries = 0;
-		ready = 1;
-	}
-	mtx_unlock(&t->t_handshake_mtx);
-
-	if (!ready)
-		return;
-	wg_peer_clear_src(peer);
-
-	GROUPTASK_ENQUEUE(&peer->p_clear_secrets);
-	DPRINTF(peer->p_sc, "Retrying handshake with peer %lu because we "
-	    "stopped hearing back after %d seconds\n", peer->p_id,
-	    NEW_HANDSHAKE_TIMEOUT);
-	GROUPTASK_ENQUEUE(&peer->p_send_initiation);
-}
-
-static void
-wg_timers_run_zero_key_material(struct wg_timers *t)
-{
-	struct wg_peer *peer = CONTAINER_OF(t, struct wg_peer, p_timers);
-	DPRINTF(peer->p_sc, "Zeroing out all keys for peer %lu, since we "
-			"haven't received a new one in %d seconds\n",
-			peer->p_id, REJECT_AFTER_TIME * 3);
-	GROUPTASK_ENQUEUE(&peer->p_clear_secrets);
-}
-
-static void
-wg_timers_run_persistent_keepalive(struct wg_timers *t)
-{
-
-	if (t->t_persistent_keepalive_interval != 0)
-		wg_send_keepalive(CONTAINER_OF(t, struct wg_peer, p_timers));
-}
-
 /* Should be called after an authenticated data packet is sent. */
 static void
 wg_timers_event_data_sent(struct wg_timers *t)
@@ -747,6 +671,8 @@ wg_timers_event_data_received(struct wg_timers *t)
 {
 	struct epoch_tracker et;
 
+	if (t->t_disabled)
+		return;
 	NET_EPOCH_ENTER(et);
 	if (!callout_pending(&t->t_send_keepalive)) {
 		callout_reset(&t->t_send_keepalive, KEEPALIVE_TIMEOUT*hz,
@@ -778,84 +704,6 @@ wg_timers_event_any_authenticated_packet_received(struct wg_timers *t)
 	callout_del(&t->t_new_handshake);
 }
 
-/* Should be called after a handshake initiation message is sent. */
-static void
-wg_timers_event_handshake_initiated(struct wg_timers *t)
-{
-	callout_reset(&t->t_retry_handshake,
-	    REKEY_TIMEOUT * hz + random() % REKEY_TIMEOUT_JITTER,
-	    (timeout_t *)wg_timers_run_retry_handshake, t);
-}
-
-static void
-wg_timers_event_handshake_responded(struct wg_timers *t)
-{
-	getmicrouptime(&t->t_handshake_touch);
-}
-
-/*
- * Should be called after a handshake response message is received and processed
- * or when getting key confirmation via the first data message.
- */
-static void
-wg_timers_event_handshake_complete(struct wg_timers *t)
-{
-	struct epoch_tracker et;
-	int ready = 0;
-
-	NET_EPOCH_ENTER(et);
-	if (!t->t_disabled) {
-		mtx_lock(&t->t_handshake_mtx);
-		t->t_handshake_retries = 0;
-		callout_del(&t->t_retry_handshake);
-		getnanotime(&t->t_handshake_complete);
-		mtx_unlock(&t->t_handshake_mtx);
-		ready = 1;
-	}
-	if (ready)
-		wg_send_keepalive(CONTAINER_OF(t, struct wg_peer, p_timers));
-	NET_EPOCH_EXIT(et);
-}
-
-/*
- * Should be called after an ephemeral key is created, which is before sending a
- * handshake response or after receiving a handshake response.
- */
-static void
-wg_timers_event_session_derived(struct wg_timers *t)
-{
-	struct epoch_tracker et;
-
-	NET_EPOCH_ENTER(et);
-	if (!t->t_disabled)
-		callout_reset(&t->t_zero_key_material,
-		    REJECT_AFTER_TIME * 3 * hz,
-		    (timeout_t *)wg_timers_run_zero_key_material, t);
-	NET_EPOCH_EXIT(et);
-}
-
-static void
-wg_timers_event_want_initiation(struct wg_timers *t)
-{
-	int	ready = 0;
-	struct wg_peer *peer;
-	struct epoch_tracker et;
-
-	NET_EPOCH_ENTER(et);
-	mtx_lock(&t->t_handshake_mtx);
-	if (!t->t_disabled && ratecheck(&t->t_handshake_touch,
-	    &rekey_interval)) {
-		t->t_handshake_retries = 0;
-		ready = 1;
-		peer = CONTAINER_OF(t, struct wg_peer, p_timers);
-	}
-	mtx_unlock(&t->t_handshake_mtx);
-
-	if (ready) 
-		GROUPTASK_ENQUEUE(&peer->p_send_initiation);
-	NET_EPOCH_EXIT(et);
-}
-
 /*
  * Should be called before a packet with authentication, whether
  * keepalive, data, or handshake is sent, or after one is received.
@@ -873,6 +721,146 @@ wg_timers_event_any_authenticated_packet_traversal(struct wg_timers *t)
 	NET_EPOCH_EXIT(et);
 }
 
+/* Should be called after a handshake initiation message is sent. */
+static void
+wg_timers_event_handshake_initiated(struct wg_timers *t)
+{
+
+	if (t->t_disabled)
+		return;
+	callout_reset(&t->t_retry_handshake,
+	    REKEY_TIMEOUT * hz + random() % REKEY_TIMEOUT_JITTER,
+	    (timeout_t *)wg_timers_run_retry_handshake, t);
+}
+
+static void
+wg_timers_event_handshake_responded(struct wg_timers *t)
+{
+	getnanouptime(&t->t_handshake_last_sent);
+}
+
+/*
+ * Should be called after a handshake response message is received and processed
+ * or when getting key confirmation via the first data message.
+ */
+static void
+wg_timers_event_handshake_complete(struct wg_timers *t)
+{
+	if (t->t_disabled)
+		return;
+	callout_del(&t->t_retry_handshake);
+	t->t_handshake_retries = 0;
+	getnanotime(&t->t_handshake_complete);
+	wg_timers_run_send_keepalive(t);
+}
+
+/*
+ * Should be called after an ephemeral key is created, which is before sending a
+ * handshake response or after receiving a handshake response.
+ */
+static void
+wg_timers_event_session_derived(struct wg_timers *t)
+{
+
+	if (t->t_disabled)
+		return;
+	callout_reset(&t->t_zero_key_material,
+	    REJECT_AFTER_TIME * 3 * hz,
+	    (timeout_t *)wg_timers_run_zero_key_material, t);
+}
+
+static void
+wg_timers_event_want_initiation(struct wg_timers *t)
+{
+
+	if (t->t_disabled)
+		return;
+	wg_timers_run_send_initiation(t, 0);
+}
+
+static void
+wg_timers_run_send_initiation(struct wg_timers *t, int is_retry)
+{
+	struct wg_peer	 *peer = CONTAINER_OF(t, struct wg_peer, p_timers);
+	if (!is_retry)
+		t->t_handshake_retries = 0;
+	if (wg_timers_expired_handshake_last_sent(t) == ETIMEDOUT)
+		GROUPTASK_ENQUEUE(&peer->p_send_initiation);
+}
+
+static void
+wg_timers_run_retry_handshake(struct wg_timers *t)
+{
+	struct wg_peer	*peer = CONTAINER_OF(t, struct wg_peer, p_timers);
+	int		 retries;
+
+	retries = atomic_fetchadd_int(&t->t_handshake_retries, 1);
+
+	if (retries <= MAX_TIMER_HANDSHAKES) {
+		DPRINTF(peer->p_sc, "Handshake for peer %lu did not complete "
+		    "after %d seconds, retrying (try %d)\n", peer->p_id,
+		    REKEY_TIMEOUT, t->t_handshake_retries + 1);
+		wg_peer_clear_src(peer);
+		wg_timers_run_send_initiation(t, 1);
+	} else {
+		DPRINTF(peer->p_sc, "Handshake for peer %lu did not complete "
+		    "after %d retries, giving up\n", peer->p_id,
+		    MAX_TIMER_HANDSHAKES + 2);
+
+		callout_del(&t->t_send_keepalive);
+		if (!callout_pending(&t->t_zero_key_material))
+			callout_reset(&t->t_zero_key_material, REJECT_AFTER_TIME * 3 * hz,
+			    (timeout_t *)wg_timers_run_zero_key_material, t);
+	}
+}
+
+static void
+wg_timers_run_send_keepalive(struct wg_timers *t)
+{
+	struct wg_peer	*peer = CONTAINER_OF(t, struct wg_peer, p_timers);
+
+	GROUPTASK_ENQUEUE(&peer->p_send_keepalive);
+	if (t->t_need_another_keepalive) {
+		t->t_need_another_keepalive = 0;
+		callout_reset(&t->t_send_keepalive,
+		    KEEPALIVE_TIMEOUT*hz,
+		     (timeout_t *)wg_timers_run_send_keepalive, peer);
+	}
+}
+
+static void
+wg_timers_run_new_handshake(struct wg_timers *t)
+{
+	struct wg_peer	*peer = CONTAINER_OF(t, struct wg_peer, p_timers);
+
+	DPRINTF(peer->p_sc, "Retrying handshake with peer %lu because we "
+	    "stopped hearing back after %d seconds\n",
+	    peer->p_id, NEW_HANDSHAKE_TIMEOUT);
+	wg_peer_clear_src(peer);
+
+	wg_timers_run_send_initiation(t, 0);
+}
+
+static void
+wg_timers_run_zero_key_material(struct wg_timers *t)
+{
+	struct wg_peer *peer = CONTAINER_OF(t, struct wg_peer, p_timers);
+
+	DPRINTF(peer->p_sc, "Zeroing out all keys for peer %lu, since we "
+			"haven't received a new one in %d seconds\n",
+			peer->p_id, REJECT_AFTER_TIME * 3);
+	GROUPTASK_ENQUEUE(&peer->p_clear_secrets);
+}
+
+static void
+wg_timers_run_persistent_keepalive(struct wg_timers *t)
+{
+	struct wg_peer	 *peer = CONTAINER_OF(t, struct wg_peer, p_timers);
+
+	if (t->t_persistent_keepalive_interval != 0)
+		GROUPTASK_ENQUEUE(&peer->p_send_keepalive);
+}
+
 static void
 wg_peer_timers_init(struct wg_peer *peer)
 {
@@ -886,13 +874,6 @@ wg_peer_timers_init(struct wg_peer *peer)
 	callout_init(&t->t_new_handshake, true);
 	callout_init(&t->t_zero_key_material, true);
 	callout_init(&t->t_persistent_keepalive, true);
-}
-
-void
-wg_timers_get_last_handshake(struct wg_timers *t, struct timespec *time)
-{
-	time->tv_sec = t->t_handshake_complete.tv_sec;
-	time->tv_nsec = t->t_handshake_complete.tv_nsec;
 }
 
 static void
@@ -910,16 +891,34 @@ wg_timers_disable(struct wg_timers *t)
 	callout_del(&t->t_persistent_keepalive);
 }
 
-int
-wg_timers_expired(struct timespec *birthdate, time_t sec, long nsec)
+void
+wg_timers_get_last_handshake(struct wg_timers *t, struct timespec *time)
 {
-	struct timespec time;
-	struct timespec diff = { .tv_sec = sec, .tv_nsec = nsec };
-
-	getnanotime(&time);
-	timespecsub(&time, &diff, &time);
-	return timespeccmp(birthdate, &time, <) ? ETIMEDOUT : 0;
+	time->tv_sec = t->t_handshake_complete.tv_sec;
+	time->tv_nsec = t->t_handshake_complete.tv_nsec;
 }
+
+static int
+wg_timers_expired_handshake_last_sent(struct wg_timers *t)
+{
+	struct timespec uptime;
+	struct timespec expire = { .tv_sec = REKEY_TIMEOUT, .tv_nsec = 0 };
+
+	getnanouptime(&uptime);
+	timespecadd(&t->t_handshake_last_sent, &expire, &expire);
+	return timespeccmp(&uptime, &expire, >) ? ETIMEDOUT : 0;
+}
+
+static int
+wg_timers_check_handshake_last_sent(struct wg_timers *t)
+{
+	int ret;
+
+	if ((ret = wg_timers_expired_handshake_last_sent(t)) == ETIMEDOUT)
+		getnanouptime(&t->t_handshake_last_sent);
+	return (ret);
+}
+
 /* Queue */
 void
 wg_queue_init(struct wg_queue *q, const char *name)
@@ -1464,6 +1463,9 @@ wg_send_initiation(struct wg_peer *peer)
 	struct epoch_tracker et;
 	int ret;
 
+	if (wg_timers_check_handshake_last_sent(&peer->p_timers) != ETIMEDOUT)
+		return;
+
 	NET_EPOCH_ENTER(et);
 	ret = noise_create_initiation(&peer->p_remote, &pkt.init);
 	if (ret)
@@ -1722,19 +1724,23 @@ wg_handshake(struct wg_softc *sc, struct mbuf *m)
 	/* This is global, so that our load calculation applies to the whole
 	 * system. We don't care about races with it at all.
 	 */
-	static struct timespec last_under_load;
+	static struct timeval wg_last_underload;
 	int packet_needs_cookie;
-	int under_load, res;
+	int underload, res;
 
-	under_load = mbufq_len(&sc->sc_handshake_queue) >=
+	underload = mbufq_len(&sc->sc_handshake_queue) >=
 			MAX_QUEUED_INCOMING_HANDSHAKES / 8;
-	if (under_load)
-		getnanotime(&last_under_load);
-	else if (last_under_load.tv_sec != 0)
-		under_load = !wg_timers_expired(&last_under_load, 1, 0);
+	if (underload)
+		getmicrouptime(&wg_last_underload);
+	else if (wg_last_underload.tv_sec != 0) {
+		if (!ratecheck(&wg_last_underload, &underload_interval))
+			underload = 1;
+		else
+			bzero(&wg_last_underload, sizeof(wg_last_underload));
+	}
 
     res = wg_cookie_validate_packet(&sc->sc_cookie, m,
-	    under_load);
+	    underload);
 
 	if (res && res != EAGAIN) {
 		printf("validate_packet got %d\n", res);
