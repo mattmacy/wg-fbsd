@@ -110,11 +110,6 @@ static int	wg_socket_bind(struct wg_softc *sc, struct wg_socket *);
 static int	wg_send(struct wg_socket *, struct wg_endpoint *, struct mbuf *);
 
 /* Timers */
-static void	wg_timers_retry_handshake(struct wg_timers *);
-static void	wg_timers_send_keepalive(struct wg_timers *);
-static void	wg_timers_new_handshake(struct wg_timers *);
-static void	wg_timers_zero_key_material(struct wg_timers *);
-static void	wg_peer_expired_send_persistent_keepalive(struct wg_timers *);
 static void	wg_timers_event_data_sent(struct wg_timers *);
 static void	wg_timers_event_data_received(struct wg_timers *);
 static void	wg_timers_event_any_authenticated_packet_sent(struct wg_timers *);
@@ -123,9 +118,15 @@ static void	wg_timers_event_handshake_initiated(struct wg_timers *);
 static void	wg_timers_event_handshake_responded(struct wg_timers *);
 static void	wg_timers_event_handshake_complete(struct wg_timers *);
 static void	wg_timers_event_session_derived(struct wg_timers *);
+static void	wg_timers_event_any_authenticated_packet_traversal(struct wg_timers *);
 static void	wg_timers_event_want_initiation(struct wg_timers *);
 
-static void	wg_timers_event_any_authenticated_packet_traversal(struct wg_timers *);
+static void	wg_timers_run_new_handshake(struct wg_timers *);
+static void	wg_timers_run_send_keepalive(struct wg_timers *);
+static void	wg_timers_run_retry_handshake(struct wg_timers *);
+static void	wg_timers_run_zero_key_material(struct wg_timers *);
+static void	wg_timers_run_persistent_keepalive(struct wg_timers *);
+
 static void	wg_peer_timers_init(struct wg_peer *);
 static void	wg_timers_disable(struct wg_timers *);
 int	wg_timers_expired(struct timespec *, time_t, long);
@@ -643,7 +644,7 @@ wg_send(struct wg_socket *so, struct wg_endpoint *e, struct mbuf *m)
 
 /* Timers */
 void
-wg_timers_retry_handshake(struct wg_timers *t)
+wg_timers_run_retry_handshake(struct wg_timers *t)
 {
 	struct wg_peer	*peer = CONTAINER_OF(t, struct wg_peer, p_timers);
 	int		 retries, ready = 0;
@@ -665,12 +666,12 @@ wg_timers_retry_handshake(struct wg_timers *t)
 		callout_del(&t->t_send_keepalive);
 		if (!callout_pending(&t->t_zero_key_material))
 			callout_reset(&t->t_zero_key_material, REJECT_AFTER_TIME * 3 * hz,
-			    (timeout_t *)wg_timers_zero_key_material, t);
+			    (timeout_t *)wg_timers_run_zero_key_material, t);
 	}
 }
 
 static void
-wg_timers_send_keepalive(struct wg_timers *t)
+wg_timers_run_send_keepalive(struct wg_timers *t)
 {
 	struct wg_peer	*peer = CONTAINER_OF(t, struct wg_peer, p_timers);
 
@@ -679,12 +680,12 @@ wg_timers_send_keepalive(struct wg_timers *t)
 		t->t_need_another_keepalive = 0;
 		callout_reset(&t->t_send_keepalive,
 		    KEEPALIVE_TIMEOUT*hz,
-		     (timeout_t *)wg_timers_send_keepalive, peer);
+		     (timeout_t *)wg_timers_run_send_keepalive, peer);
 	}
 }
 
 static void
-wg_timers_new_handshake(struct wg_timers *t)
+wg_timers_run_new_handshake(struct wg_timers *t)
 {
 	struct wg_peer	*peer = CONTAINER_OF(t, struct wg_peer, p_timers);
 	int		 ready = 0;
@@ -708,7 +709,7 @@ wg_timers_new_handshake(struct wg_timers *t)
 }
 
 static void
-wg_timers_zero_key_material(struct wg_timers *t)
+wg_timers_run_zero_key_material(struct wg_timers *t)
 {
 	struct wg_peer *peer = CONTAINER_OF(t, struct wg_peer, p_timers);
 	DPRINTF(peer->p_sc, "Zeroing out all keys for peer %lu, since we "
@@ -718,7 +719,7 @@ wg_timers_zero_key_material(struct wg_timers *t)
 }
 
 static void
-wg_peer_expired_send_persistent_keepalive(struct wg_timers *t)
+wg_timers_run_persistent_keepalive(struct wg_timers *t)
 {
 
 	if (t->t_persistent_keepalive_interval != 0)
@@ -736,7 +737,7 @@ wg_timers_event_data_sent(struct wg_timers *t)
 	if (!t->t_disabled && !callout_pending(&t->t_new_handshake))
 		callout_reset(&t->t_new_handshake,
 		    NEW_HANDSHAKE_TIMEOUT * hz + (random() % REKEY_TIMEOUT_JITTER),
-		    (timeout_t *)wg_timers_new_handshake, t);
+		    (timeout_t *)wg_timers_run_new_handshake, t);
 	NET_EPOCH_EXIT(et);
 }
 
@@ -749,7 +750,7 @@ wg_timers_event_data_received(struct wg_timers *t)
 	NET_EPOCH_ENTER(et);
 	if (!callout_pending(&t->t_send_keepalive)) {
 		callout_reset(&t->t_send_keepalive, KEEPALIVE_TIMEOUT*hz,
-		    (timeout_t *)wg_timers_send_keepalive, t);
+		    (timeout_t *)wg_timers_run_send_keepalive, t);
 	} else {
 		t->t_need_another_keepalive = 1;
 	}
@@ -783,7 +784,7 @@ wg_timers_event_handshake_initiated(struct wg_timers *t)
 {
 	callout_reset(&t->t_retry_handshake,
 	    REKEY_TIMEOUT * hz + random() % REKEY_TIMEOUT_JITTER,
-	    (timeout_t *)wg_timers_retry_handshake, t);
+	    (timeout_t *)wg_timers_run_retry_handshake, t);
 }
 
 static void
@@ -829,7 +830,7 @@ wg_timers_event_session_derived(struct wg_timers *t)
 	if (!t->t_disabled)
 		callout_reset(&t->t_zero_key_material,
 		    REJECT_AFTER_TIME * 3 * hz,
-		    (timeout_t *)wg_timers_zero_key_material, t);
+		    (timeout_t *)wg_timers_run_zero_key_material, t);
 	NET_EPOCH_EXIT(et);
 }
 
@@ -868,7 +869,7 @@ wg_timers_event_any_authenticated_packet_traversal(struct wg_timers *t)
 	if (!t->t_disabled && t->t_persistent_keepalive_interval > 0)
 		callout_reset(&t->t_persistent_keepalive,
 		     t->t_persistent_keepalive_interval *hz,
-		    (timeout_t *)wg_peer_expired_send_persistent_keepalive, t);
+		    (timeout_t *)wg_timers_run_persistent_keepalive, t);
 	NET_EPOCH_EXIT(et);
 }
 
@@ -1562,7 +1563,6 @@ wg_deliver_out(struct wg_peer *peer)
 	while ((m = wg_queue_dequeue(&peer->p_encap_queue, &t)) != NULL) {
 		/* t_mbuf will contain the encrypted packet */
 		if (t->t_mbuf == NULL){
-			printf("packet not encrypted\n");
 			if_inc_counter(peer->p_sc->sc_ifp, IFCOUNTER_OERRORS, 1);
 			wg_m_freem(m);
 			continue;
@@ -1967,6 +1967,10 @@ wg_softc_decrypt(struct wg_softc *sc)
 	struct epoch_tracker et;
 	struct mbuf *m;
 
+#if defined(__aarch64__) || defined(__amd64__) || defined(__i386__)
+	if (PCB_USER_FPU(curpcb))
+		fpu_kern_thread(0);
+#endif
 	NET_EPOCH_ENTER(et);
 	while ((m = buf_ring_dequeue_mc(sc->sc_decap_ring)) != NULL)
 		wg_decap(sc, m);
@@ -1979,6 +1983,10 @@ wg_softc_encrypt(struct wg_softc *sc)
 	struct mbuf *m;
 	struct epoch_tracker et;
 
+#if defined(__aarch64__) || defined(__amd64__) || defined(__i386__)
+	if (PCB_USER_FPU(curpcb))
+		fpu_kern_thread(0);
+#endif
 	NET_EPOCH_ENTER(et);
 	while ((m = buf_ring_dequeue_mc(sc->sc_encap_ring)) != NULL)
 		wg_encap(sc, m);
