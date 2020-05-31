@@ -93,14 +93,8 @@ struct wg_pkt_data {
 } __packed;
 
 #define MTAG_WIREGUARD 0xBEAD
-struct wg_tag {
-	struct m_tag wt_tag;
-	struct wg_endpoint t_endpoint;
-	struct wg_peer *t_peer;
-	struct mbuf *t_mbuf;
-	sa_family_t t_family;
-	int			 t_done;
-};
+#define WG_PKT_WITH_PADDING(n)	(((n) + (16-1)) & (~(16-1)))
+
 
 #define DPRINTF(sc,  ...) if_printf(sc->sc_ifp, ##__VA_ARGS__)
 
@@ -172,7 +166,7 @@ static void	wg_deliver_in(struct wg_peer *);
 static int	wg_send_buf(struct wg_socket *, struct wg_endpoint *, uint8_t *, size_t);
 
 
-void	wg_send_keepalive(struct wg_peer *);
+static void	wg_send_keepalive(struct wg_peer *);
 
 /* Packet */
 static struct wg_endpoint *wg_mbuf_endpoint_get(struct mbuf *);
@@ -219,7 +213,7 @@ callout_del(struct callout *c)
 	return (callout_stop(c) > 0);
 }
 
-static struct wg_tag *
+struct wg_tag *
 wg_tag_get(struct mbuf *m)
 {
 	struct m_tag *tag;
@@ -1671,7 +1665,7 @@ retry:
 	return (ret);
 }
 
-void
+static void
 wg_send_keepalive(struct wg_peer *peer)
 {
 	struct mbuf *m = NULL;
@@ -1687,7 +1681,9 @@ wg_send_keepalive(struct wg_peer *peer)
 		return;
 	}
 	t->t_peer = peer;
-
+	t->t_mbuf = NULL;
+	t->t_done = 0;
+	t->t_mtu = 0; /* MTU == 0 OK for keepalive */
 send:
 	NET_EPOCH_ENTER(et);
 	if (noise_remote_ready(&peer->p_remote) == 0) {
@@ -1843,8 +1839,8 @@ wg_encap(struct wg_softc *sc, struct mbuf *m)
 
 	verify_peer_magic(peer);
 
-	padding_len = WG_PADDING_SIZE(m->m_pkthdr.len);
-	plaintext_len = m->m_pkthdr.len + padding_len;
+	plaintext_len = MIN(WG_PKT_WITH_PADDING(m->m_pkthdr.len), t->t_mtu);
+	padding_len = plaintext_len - m->m_pkthdr.len;
 	out_len = sizeof(struct wg_pkt_data) + plaintext_len + NOISE_MAC_SIZE;
 
 	if ((mc = m_getjcl(M_NOWAIT, MT_DATA, M_PKTHDR, MCLBYTES)) == NULL)
@@ -2149,6 +2145,7 @@ wg_input(struct mbuf *m0, int offset, struct inpcb *inpcb,
 			    p_remote);
 			t->t_mbuf = NULL;
 			t->t_done = 0;
+
 			wg_queue_in(t->t_peer, m);
 			wg_decrypt_dispatch(sc);
 		}

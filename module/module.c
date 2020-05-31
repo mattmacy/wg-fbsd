@@ -224,10 +224,16 @@ wg_transmit(struct ifnet *ifp, struct mbuf *m)
 	sa_family_t family;
 	struct epoch_tracker et;
 	struct wg_peer *peer;
+	struct wg_tag *t;
 	int rc;
 
 	rc = 0;
 	sc = iflib_get_softc(ifp->if_softc);
+
+	if ((t = wg_tag_get(m)) == NULL) {
+		rc = ENOBUFS;
+		goto early_out;
+	}
 	ETHER_BPF_MTAP(ifp, m);
 
 	NET_EPOCH_ENTER(et);
@@ -245,6 +251,11 @@ wg_transmit(struct ifnet *ifp, struct mbuf *m)
 		/* XXX log */
 		goto err;
 	}
+	t->t_peer = peer;
+	t->t_mbuf = NULL;
+	t->t_done = 0;
+	t->t_mtu = ifp->if_mtu;
+
 	rc = wg_queue_out(peer, m);
 	if (rc == 0)
 		wg_encrypt_dispatch(peer->p_sc);
@@ -252,6 +263,7 @@ wg_transmit(struct ifnet *ifp, struct mbuf *m)
 	return (rc); 
 err:
 	NET_EPOCH_EXIT(et);
+early_out:
 	if_inc_counter(sc->sc_ifp, IFCOUNTER_OERRORS, 1);
 	/* XXX send ICMP unreachable */
 	m_free(m);
@@ -272,8 +284,7 @@ wg_attach_post(if_ctx_t ctx)
 
 	sc = iflib_get_softc(ctx);
 	ifp = iflib_get_ifp(ctx);
-	if_setmtu(ifp, ETHERMTU - 50);
-	/* XXX do sokect_init */
+	if_setmtu(ifp, ETHERMTU - 80);
 
 	if_setflagbits(ifp, IFF_NOARP, IFF_POINTOPOINT);
 	ifp->if_transmit = wg_transmit;

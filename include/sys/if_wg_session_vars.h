@@ -43,8 +43,6 @@
 #define WG_KEY_SIZE		 	32
 #define WG_MSG_PADDING_SIZE 		16
 
-#define WG_PADDING_SIZE(n) ((-(n)) & (WG_MSG_PADDING_SIZE - 1))
-
 
 /* Constant for session */
 #define REKEY_TIMEOUT			5
@@ -265,6 +263,17 @@ struct wg_softc {
 	struct mtx	sc_mtx;
 };
 
+struct wg_tag {
+	struct m_tag wt_tag;
+	struct wg_endpoint t_endpoint;
+	struct wg_peer *t_peer;
+	struct mbuf *t_mbuf;
+	sa_family_t t_family;
+	int		t_done;
+	int		t_mtu;
+};
+
+
 struct wg_peer *
 	wg_route_lookup(struct wg_route_table *, struct mbuf *,
 				enum route_direction);
@@ -292,5 +301,8 @@ struct noise_remote *wg_index_get(struct wg_softc *, uint32_t);
 void wg_index_drop(struct wg_softc *, uint32_t);
 void wg_encrypt_dispatch(struct wg_softc *);
 void wg_decrypt_dispatch(struct wg_softc *);
+
+struct wg_tag *wg_tag_get(struct mbuf *m);
+
 
 #endif /* _IF_WG_VARS_H_ */
