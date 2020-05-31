@@ -163,7 +163,7 @@ static void	wg_peer_get_endpoint(struct wg_peer *, struct wg_endpoint *);
 
 static void	wg_deliver_out(struct wg_peer *);
 static void	wg_deliver_in(struct wg_peer *);
-static int	wg_send_buf(struct wg_socket *, struct wg_endpoint *, uint8_t *, size_t);
+static void	wg_send_buf(struct wg_socket *, struct wg_endpoint *, uint8_t *, size_t);
 
 
 static void	wg_send_keepalive(struct wg_peer *);
@@ -1438,7 +1438,7 @@ wg_peer_free(epoch_context_t ctx)
 	zfree(peer, M_WG);
 }
 
-static int
+static void
 wg_peer_send_buf(struct wg_peer *peer, uint8_t *buf, size_t len)
 {
 	struct wg_endpoint	 endpoint;
@@ -1447,7 +1447,7 @@ wg_peer_send_buf(struct wg_peer *peer, uint8_t *buf, size_t len)
 	wg_timers_event_any_authenticated_packet_traversal(&peer->p_timers);
 	wg_timers_event_any_authenticated_packet_sent(&peer->p_timers);
 	wg_peer_get_endpoint(peer, &endpoint);
-	return wg_send_buf(&peer->p_sc->sc_socket, &endpoint, buf, len);
+	wg_send_buf(&peer->p_sc->sc_socket, &endpoint, buf, len);
 }
 
 static void
@@ -1467,9 +1467,8 @@ wg_send_initiation(struct wg_peer *peer)
 	pkt.t = le32toh(MESSAGE_HANDSHAKE_INITIATION);
 	cookie_maker_mac(&peer->p_cookie, &pkt.m, &pkt,
 	    sizeof(pkt)-sizeof(pkt.m));
-	ret = wg_peer_send_buf(peer, (uint8_t *)&pkt, sizeof(pkt));
-	if (ret == 0)
-		wg_timers_event_handshake_initiated(&peer->p_timers);
+	wg_peer_send_buf(peer, (uint8_t *)&pkt, sizeof(pkt));
+	wg_timers_event_handshake_initiated(&peer->p_timers);
 out:
 	NET_EPOCH_EXIT(et);
 }
@@ -1492,9 +1491,8 @@ wg_send_response(struct wg_peer *peer)
 	pkt.t = MESSAGE_HANDSHAKE_RESPONSE;
 	cookie_maker_mac(&peer->p_cookie, &pkt.m, &pkt,
 	     sizeof(pkt)-sizeof(pkt.m));
-	ret = wg_peer_send_buf(peer, (uint8_t*)&pkt, sizeof(pkt));
-	if (ret == 0)
-		wg_timers_event_handshake_responded(&peer->p_timers);
+	wg_peer_send_buf(peer, (uint8_t*)&pkt, sizeof(pkt));
+	wg_timers_event_handshake_responded(&peer->p_timers);
 out:
 	NET_EPOCH_EXIT(et);
 	return (ret);
@@ -1640,7 +1638,7 @@ wg_deliver_in(struct wg_peer *peer)
 	NET_EPOCH_EXIT(et);
 }
 
-int
+static void
 wg_send_buf(struct wg_socket *so, struct wg_endpoint *e, uint8_t *buf,
     size_t len)
 {
@@ -1660,9 +1658,8 @@ retry:
 			goto retry;
 		}
 	} else {
-		ret = wg_send(so, e, m);
+		wg_send(so, e, m);
 	}
-	return (ret);
 }
 
 static void
