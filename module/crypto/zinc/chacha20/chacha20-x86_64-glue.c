@@ -2,11 +2,14 @@
 /*
  * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
-
+#ifdef __linux__
 #include <asm/fpu/api.h>
 #include <asm/cpufeature.h>
 #include <asm/processor.h>
 #include <asm/intel-family.h>
+#else
+#include <sys/simd-x86_64.h>
+#endif
 
 asmlinkage void hchacha20_ssse3(u32 *derived_key, const u8 *nonce,
 				const u8 *key);
@@ -29,6 +32,7 @@ static bool *const chacha20_nobs[] __initconst = {
 
 static void __init chacha20_fpu_init(void)
 {
+#ifdef __linux__
 	chacha20_use_ssse3 = boot_cpu_has(X86_FEATURE_SSSE3);
 	chacha20_use_avx2 =
 		boot_cpu_has(X86_FEATURE_AVX) &&
@@ -51,6 +55,23 @@ static void __init chacha20_fpu_init(void)
 		cpu_has_xfeatures(XFEATURE_MASK_SSE | XFEATURE_MASK_YMM |
 				  XFEATURE_MASK_AVX512, NULL);
 #endif
+#else
+	chacha20_use_ssse3 = !!(cpu_feature2 & CPUID2_SSSE3);
+	chacha20_use_avx2 = !!(cpu_feature2 & CPUID2_AVX) &&
+		!!(cpu_stdext_feature & CPUID_STDEXT_AVX2) &&
+		__ymm_enabled();
+	chacha20_use_avx512 = chacha20_use_avx2 &&
+		!!(cpu_stdext_feature & CPUID_STDEXT_AVX512F)  &&
+		__zmm_enabled();
+	chacha20_use_avx512vl = chacha20_use_avx512 &&
+		!!(cpu_stdext_feature & CPUID_STDEXT_AVX512F)  &&
+		!!(cpu_stdext_feature & CPUID_STDEXT_AVX512VL);
+#endif
+	printf("ssse3: %d  avx2: %d avx512: %d avx512vl: %d\n",
+		   chacha20_use_ssse3,
+		   chacha20_use_avx2,
+		   chacha20_use_avx512,
+		   chacha20_use_avx512vl);
 }
 
 static inline bool chacha20_arch(struct chacha20_ctx *ctx, u8 *dst,
@@ -61,20 +82,20 @@ static inline bool chacha20_arch(struct chacha20_ctx *ctx, u8 *dst,
 	BUILD_BUG_ON(PAGE_SIZE < CHACHA20_BLOCK_SIZE ||
 		     PAGE_SIZE % CHACHA20_BLOCK_SIZE);
 
-	if (!IS_ENABLED(CONFIG_AS_SSSE3) || !chacha20_use_ssse3 ||
+	if ( !chacha20_use_ssse3 ||
 	    len <= CHACHA20_BLOCK_SIZE || !simd_use(simd_context))
 		return false;
 
 	for (;;) {
 		const size_t bytes = min_t(size_t, len, PAGE_SIZE);
 
-		if (IS_ENABLED(CONFIG_AS_AVX512) && chacha20_use_avx512 &&
+		if (chacha20_use_avx512 &&
 		    len >= CHACHA20_BLOCK_SIZE * 8)
 			chacha20_avx512(dst, src, bytes, ctx->key, ctx->counter);
-		else if (IS_ENABLED(CONFIG_AS_AVX512) && chacha20_use_avx512vl &&
+		else if (chacha20_use_avx512vl &&
 			 len >= CHACHA20_BLOCK_SIZE * 4)
 			chacha20_avx512vl(dst, src, bytes, ctx->key, ctx->counter);
-		else if (IS_ENABLED(CONFIG_AS_AVX2) && chacha20_use_avx2 &&
+		else if (chacha20_use_avx2 &&
 			 len >= CHACHA20_BLOCK_SIZE * 4)
 			chacha20_avx2(dst, src, bytes, ctx->key, ctx->counter);
 		else

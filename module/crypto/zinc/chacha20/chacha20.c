@@ -167,8 +167,10 @@ static void chacha20_generic(struct chacha20_ctx *ctx, u8 *out, const u8 *in,
 void chacha20(struct chacha20_ctx *ctx, u8 *dst, const u8 *src, u32 len,
 	      simd_context_t *simd_context)
 {
-	if (!chacha20_arch(ctx, dst, src, len, simd_context))
+	if (!chacha20_arch(ctx, dst, src, len, simd_context)) {
+		printf("doing generic\n");
 		chacha20_generic(ctx, dst, src, len);
+	}
 }
 EXPORT_SYMBOL(chacha20);
 

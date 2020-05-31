@@ -1,6 +1,11 @@
 #ifndef SYS_SUPPORT_H_
 #define SYS_SUPPORT_H_
-#ifndef __LOCORE
+#ifdef __LOCORE
+#include <machine/asm.h>
+#define SYM_FUNC_START ENTRY
+#define SYM_FUNC_END END
+
+#else
 #include <sys/types.h>
 #include <sys/limits.h>
 #include <sys/endian.h>
@@ -42,36 +47,8 @@ MALLOC_DECLARE(M_WG);
 
 #define typeof(x) __typeof__(x)
 
-#define __typecheck(x, y) \
-		(!!(sizeof((typeof(x) *)1 == (typeof(y) *)1)))
 
-/*
- * This returns a constant expression while determining if an argument is
- * a constant expression, most importantly without evaluating the argument.
- * Glory to Martin Uecker <Martin.Uecker@med.uni-goettingen.de>
- */
-#define __is_constexpr(x) \
-	(sizeof(int) == sizeof(*(8 ? ((void *)((long)(x) * 0l)) : (int *)8)))
-
-#define __no_side_effects(x, y) \
-		(__is_constexpr(x) && __is_constexpr(y))
-
-#define __safe_cmp(x, y) \
-		(__typecheck(x, y) && __no_side_effects(x, y))
-
-#define __cmp(x, y, op)	((x) op (y) ? (x) : (y))
-
-#define __cmp_once(x, y, unique_x, unique_y, op) ({	\
-		typeof(x) unique_x = (x);		\
-		typeof(y) unique_y = (y);		\
-		__cmp(unique_x, unique_y, op); })
-
-#define __careful_cmp(x, y, op) \
-	__builtin_choose_expr(__safe_cmp(x, y), \
-		__cmp(x, y, op), \
-		__cmp_once(x, y, __UNIQUE_ID(__x), __UNIQUE_ID(__y), op))
-
-#define min_t(type, x, y)	__careful_cmp((type)(x), (type)(y), <)
+#define min_t(t, a, b) ({ t __a = (a); t __b = (b); __a > __b ? __b : __a; })
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -82,7 +59,7 @@ typedef uint64_t  __le64;
 
 #define __must_check		__attribute__((__warn_unused_result__))
 #define asmlinkage
-#define __ro_after_init
+#define __ro_after_init	__read_mostly
 
 #define get_unaligned_le32(x) le32dec(x)
 #define get_unaligned_le64(x) le64dec(x)
@@ -91,8 +68,11 @@ typedef uint64_t  __le64;
 #define cpu_to_le32(x) htole32(x)
 #define letoh64(x) le64toh(x)
 
-#define	need_resched() (curthread->td_flags & (TDF_NEEDRESCHED|TDF_ASTPENDING))
+#define	need_resched() \
+	((curthread->td_flags & (TDF_NEEDRESCHED|TDF_ASTPENDING)) || \
+	 curthread->td_owepreempt)
 
+ 
 #define CONTAINER_OF(a, b, c) __containerof((a), b, c)
 
 typedef struct {
@@ -123,13 +103,18 @@ put_unaligned_le32(u32 val, void *p)
 
 #define U32_MAX		((u32)~0U)
 
-#define	kfpu_begin() {							\
-	critical_enter();					\
-	fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX); \
+#define	kfpu_begin(ctx) {							\
+		if (ctx->sc_fpu_ctx == NULL)	 {			 \
+			printf("allocate fpu ctx\n");			 \
+			ctx->sc_fpu_ctx = fpu_kern_alloc_ctx(0); \
+		}														 \
+		critical_enter();										 \
+	fpu_kern_enter(curthread, ctx->sc_fpu_ctx, FPU_KERN_NORMAL); \
 }
 
-#define	kfpu_end()	 {						 \
-		fpu_kern_leave(curthread, NULL); \
+#define	kfpu_end(ctx)	 {						 \
+		MPASS(ctx->sc_fpu_ctx != NULL);			 \
+		fpu_kern_leave(curthread, ctx->sc_fpu_ctx);	\
 		critical_exit();			     \
 }
 
@@ -137,9 +122,15 @@ typedef enum {
 	HAVE_NO_SIMD = 1 << 0,
 	HAVE_FULL_SIMD = 1 << 1,
 	HAVE_SIMD_IN_USE = 1 << 31
+} simd_context_state_t;
+
+typedef struct {
+	simd_context_state_t sc_state;
+	struct fpu_kern_ctx *sc_fpu_ctx;
 } simd_context_t;
 
-#define DONT_USE_SIMD ((simd_context_t []){ HAVE_NO_SIMD })
+
+#define DONT_USE_SIMD NULL
 
 static __must_check inline bool
 may_use_simd(void)
@@ -154,36 +145,53 @@ may_use_simd(void)
 static inline void
 simd_get(simd_context_t *ctx)
 {
-	*ctx = may_use_simd() ? HAVE_FULL_SIMD : HAVE_NO_SIMD;
+	ctx->sc_state = may_use_simd() ? HAVE_FULL_SIMD : HAVE_NO_SIMD;
 }
 
 static inline void
 simd_put(simd_context_t *ctx)
 {
-	if (*ctx & HAVE_SIMD_IN_USE)
-		kfpu_end();
-	*ctx = HAVE_NO_SIMD;
+	if (is_fpu_kern_thread(0))
+		return;
+	if (ctx->sc_state & HAVE_SIMD_IN_USE) {
+		printf("exit SIMD\n");
+		kfpu_end(ctx);
+	}
+	ctx->sc_state = HAVE_NO_SIMD;
 }
 
 static __must_check inline bool
 simd_use(simd_context_t *ctx)
 {
-	if (!(*ctx & HAVE_FULL_SIMD))
-		return false;
-	if (*ctx & HAVE_SIMD_IN_USE)
+	if (is_fpu_kern_thread(0)) {
+		printf("is fpu kern thread \n");
 		return true;
-	kfpu_begin();
-	*ctx |= HAVE_SIMD_IN_USE;
+	}
+	if (ctx == NULL) {
+		printf("NULL context \n");
+
+		return false;
+	}
+	if (!(ctx->sc_state & HAVE_FULL_SIMD)) {
+		printf("don't have SIMD \n");
+		return false;
+	}
+	if (ctx->sc_state & HAVE_SIMD_IN_USE) {
+		printf("SIMD in use\n");
+		return true;
+	}
+	kfpu_begin(ctx);
+	ctx->sc_state |= HAVE_SIMD_IN_USE;
 	return true;
 }
 
 static inline bool
 simd_relax(simd_context_t *ctx)
 {
-	if ((*ctx & HAVE_SIMD_IN_USE) && need_resched()) {
+	if ((ctx->sc_state & HAVE_SIMD_IN_USE) && need_resched()) {
 		simd_put(ctx);
 		simd_get(ctx);
-		return true;
+		return simd_use(ctx);
 	}
 	return false;
 }

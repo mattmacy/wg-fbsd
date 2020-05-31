@@ -2512,7 +2512,8 @@ static const struct hchacha20_testvec hchacha20_testvecs[] __initconst = {{
 		    0xc1, 0x2e, 0xc4, 0x13, 0x26, 0xd3, 0xec, 0xdc }
 }};
 
-static bool __init chacha20_selftest(void)
+bool __init chacha20_selftest(void);
+bool __init chacha20_selftest(void)
 {
 	enum {
 		MAXIMUM_TEST_BUFFER_LEN = 1UL << 10,
@@ -2526,6 +2527,8 @@ static bool __init chacha20_selftest(void)
 	struct chacha20_ctx state;
 	bool success = true;
 	simd_context_t simd_context;
+
+	bzero(&simd_context, sizeof(simd_context));
 
 	offset_input = kmalloc(MAXIMUM_TEST_BUFFER_LEN + 1, GFP_KERNEL);
 	computed_output = kmalloc(MAXIMUM_TEST_BUFFER_LEN + 1, GFP_KERNEL);
@@ -2689,7 +2692,9 @@ next_test:
 	}
 
 	simd_put(&simd_context);
-
+	if (simd_context.sc_fpu_ctx) {
+		fpu_kern_free_ctx(simd_context.sc_fpu_ctx);
+	}
 out:
 	kfree(offset_input);
 	kfree(computed_output);

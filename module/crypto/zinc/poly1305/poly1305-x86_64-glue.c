@@ -3,9 +3,13 @@
  * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
 
+#ifdef __linux__
 #include <asm/cpufeature.h>
 #include <asm/processor.h>
 #include <asm/intel-family.h>
+#else
+#include <sys/simd-x86_64.h>
+#endif
 
 asmlinkage void poly1305_init_x86_64(void *ctx,
 				     const u8 key[POLY1305_KEY_SIZE]);
@@ -30,6 +34,7 @@ static bool *const poly1305_nobs[] __initconst = {
 
 static void __init poly1305_fpu_init(void)
 {
+#ifdef __linux__
 	poly1305_use_avx =
 		boot_cpu_has(X86_FEATURE_AVX) &&
 		cpu_has_xfeatures(XFEATURE_MASK_SSE | XFEATURE_MASK_YMM, NULL);
@@ -46,6 +51,16 @@ static void __init poly1305_fpu_init(void)
 				  XFEATURE_MASK_AVX512, NULL) &&
 		/* Skylake downclocks unacceptably much when using zmm. */
 		boot_cpu_data.x86_model != INTEL_FAM6_SKYLAKE_X;
+#endif
+#else
+
+	poly1305_use_avx = !!(cpu_feature2 & CPUID2_AVX) &&
+		__ymm_enabled();
+	poly1305_use_avx2 = poly1305_use_avx &&
+		!!(cpu_stdext_feature & CPUID_STDEXT_AVX2);
+	poly1305_use_avx512 = poly1305_use_avx2 &&
+		!!(cpu_stdext_feature & CPUID_STDEXT_AVX512F)  &&
+		__zmm_enabled();
 #endif
 }
 
@@ -113,7 +128,7 @@ static inline bool poly1305_blocks_arch(void *ctx, const u8 *inp,
 	BUILD_BUG_ON(PAGE_SIZE < POLY1305_BLOCK_SIZE ||
 		     PAGE_SIZE % POLY1305_BLOCK_SIZE);
 
-	if (!IS_ENABLED(CONFIG_AS_AVX) || !poly1305_use_avx ||
+	if (!poly1305_use_avx ||
 	    (len < (POLY1305_BLOCK_SIZE * 18) && !state->is_base2_26) ||
 	    !simd_use(simd_context)) {
 		convert_to_base2_64(ctx);
@@ -124,9 +139,9 @@ static inline bool poly1305_blocks_arch(void *ctx, const u8 *inp,
 	for (;;) {
 		const size_t bytes = min_t(size_t, len, PAGE_SIZE);
 
-		if (IS_ENABLED(CONFIG_AS_AVX512) && poly1305_use_avx512)
+		if (poly1305_use_avx512)
 			poly1305_blocks_avx512(ctx, inp, bytes, padbit);
-		else if (IS_ENABLED(CONFIG_AS_AVX2) && poly1305_use_avx2)
+		else if (poly1305_use_avx2)
 			poly1305_blocks_avx2(ctx, inp, bytes, padbit);
 		else
 			poly1305_blocks_avx(ctx, inp, bytes, padbit);

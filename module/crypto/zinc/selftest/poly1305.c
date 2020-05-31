@@ -1043,6 +1043,7 @@ static bool __init poly1305_selftest(void)
 	bool success = true;
 	size_t i, j;
 
+	bzero(&simd_context, sizeof(simd_context));
 	simd_get(&simd_context);
 	for (i = 0; i < ARRAY_SIZE(poly1305_testvecs); ++i) {
 		struct poly1305_ctx poly1305;
@@ -1102,6 +1103,8 @@ static bool __init poly1305_selftest(void)
 		}
 	}
 	simd_put(&simd_context);
-
+	if (simd_context.sc_fpu_ctx) {
+		fpu_kern_free_ctx(simd_context.sc_fpu_ctx);
+	}
 	return success;
 }
