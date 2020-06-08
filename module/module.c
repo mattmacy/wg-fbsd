@@ -372,21 +372,140 @@ wg_stop(if_ctx_t ctx)
 	//wg_socket_reinit(sc, NULL, NULL);
 }
 
+static nvlist_t *
+wg_peer_to_nvl(struct wg_peer *peer)
+{
+	struct wg_route *rt;
+	int i, count;
+	nvlist_t *nvl;
+	caddr_t key;
+	struct wg_allowedip *aip;
+
+	if ((nvl = nvlist_create(0)) == NULL)
+		return (NULL);
+	key = peer->p_remote.r_public;
+	nvlist_add_binary(nvl, "public-key", key, WG_KEY_SIZE);
+	nvlist_add_binary(nvl, "endpoint", &peer->p_endpoint.e_remote, sizeof(struct sockaddr));
+	i = count = 0;
+	CK_LIST_FOREACH(rt, &peer->p_routes, r_entry) {
+		count++;
+	}
+	aip = malloc(count*sizeof(*aip), M_TEMP, M_WAITOK);
+	CK_LIST_FOREACH(rt, &peer->p_routes, r_entry) {
+		memcpy(&aip[i++], &rt->r_cidr, sizeof(*aip));
+	}
+	nvlist_add_binary(nvl, "allowed-ips", aip, count*sizeof(*aip));
+	free(aip, M_TEMP);
+	return (nvl);
+}
+
+static int
+wg_marshal_peers(struct wg_softc *sc, nvlist_t **nvlp, nvlist_t ***nvl_arrayp, int *peer_countp)
+{
+	struct wg_peer *peer;
+	int err, i, peer_count;
+	nvlist_t *nvl, **nvl_array;
+	struct epoch_tracker et;
+#ifdef INVARIANTS
+	void *packed;
+	size_t size;
+#endif
+	nvl = NULL;
+	nvl_array = NULL;
+	if (nvl_arrayp)
+		*nvl_arrayp = NULL;
+	if (nvlp)
+		*nvlp = NULL;
+	if (peer_countp)
+		*peer_countp = 0;
+	peer_count = sc->sc_hashtable.h_num_peers;
+	if (peer_count == 0) {
+		printf("no peers found\n");
+		return (ENOENT);
+	}
+
+	if (nvlp && (nvl = nvlist_create(0)) == NULL)
+		return (ENOMEM);
+	err = i = 0;
+	nvl_array = malloc(peer_count*sizeof(void*), M_TEMP, M_WAITOK);
+	NET_EPOCH_ENTER(et);
+	CK_LIST_FOREACH(peer, &sc->sc_hashtable.h_peers_list, p_entry) {
+		nvl_array[i] = wg_peer_to_nvl(peer);
+		if (nvl_array[i] == NULL) {
+			printf("wg_peer_to_nvl failed on %d peer\n", i);
+			break;
+		}
+#ifdef INVARIANTS
+		packed = nvlist_pack(nvl_array[i], &size);
+		if (packed == NULL) {
+			printf("nvlist_pack(%p, %p) => %d",
+				   nvl_array[i], &size, nvlist_error(nvl));
+		}
+		free(packed, M_NVLIST);
+#endif	
+		i++;
+		if (i == peer_count)
+			break;
+	}
+	NET_EPOCH_EXIT(et);
+	*peer_countp = peer_count = i;
+	if (peer_count == 0) {
+		printf("no peers found in list\n");
+		err = ENOENT;
+		goto out;
+	}
+	if (nvl) {
+		nvlist_add_nvlist_array(nvl, "peer-list",
+		    (const nvlist_t * const *)nvl_array, peer_count);
+		if ((err = nvlist_error(nvl))) {
+			printf("nvlist_add_nvlist_array(%p, \"peer-list\", %p, %d) => %d\n",
+			    nvl, nvl_array, peer_count, err);
+			goto out;
+		}
+		*nvlp = nvl;
+	}
+	*nvl_arrayp = nvl_array;
+	return (0);
+ out:
+	return (err);
+}
+
+static void
+wg_marshalled_peers_free(nvlist_t *nvl, nvlist_t **nvl_array, int peer_count)
+{
+	if (nvl_array != NULL) {
+		for (int i = 0; i < peer_count; i++)
+			nvlist_destroy(nvl_array[i]);
+		free(nvl_array, M_TEMP);
+	}
+	if (nvl)
+		nvlist_destroy(nvl);
+}
+
 static int
 wg_local_show(struct wg_softc *sc, struct ifdrv *ifd)
 {
-	nvlist_t *nvl;
+	nvlist_t *nvl, **nvl_array;
 	void *packed;
 	size_t size;
-	int err;
+	int peer_count, err;
 
 	nvl = nvlist_create(0);
 	if (nvl == NULL)
 		return (ENOMEM);
+
 	err = 0;
+	packed = NULL;
 	nvlist_add_number(nvl, "listen-port", sc->sc_socket.so_port);
 	nvlist_add_binary(nvl, "public-key", sc->sc_local.l_public, WG_KEY_SIZE);
 	nvlist_add_binary(nvl, "private-key", sc->sc_local.l_private, WG_KEY_SIZE);
+	err = wg_marshal_peers(sc, NULL, &nvl_array, &peer_count);
+	if (err == 0) {
+		nvlist_add_nvlist_array(nvl, "peer-list",
+	        (const nvlist_t * const *)nvl_array, peer_count);
+	} else if  (err && err != ENOENT) {
+		goto out;
+	}
 	packed = nvlist_pack(nvl, &size);
 	if (packed == NULL)
 		return (ENOMEM);
@@ -404,7 +523,10 @@ wg_local_show(struct wg_softc *sc, struct ifdrv *ifd)
 	}
 	err = copyout(packed, ifd->ifd_data, size);
 	ifd->ifd_len = size;
-out:
+ out:
+	//if (peer_count)
+	// wg_marshalled_peers_free(nvl_peers, nvl_array, peer_count);
+	nvlist_destroy(nvl);
 	free(packed, M_NVLIST);
 	return (err);
 }
@@ -496,85 +618,19 @@ out:
 	return (err);
 }
 
-static nvlist_t *
-wg_peer_to_nvl(struct wg_peer *peer)
-{
-	struct wg_route *rt;
-	int i, count;
-	nvlist_t *nvl;
-	caddr_t key;
-	struct wg_allowedip *aip;
-
-	if ((nvl = nvlist_create(0)) == NULL)
-		return (NULL);
-	key = peer->p_remote.r_public;
-	nvlist_add_binary(nvl, "public-key", key, WG_KEY_SIZE);
-	nvlist_add_binary(nvl, "endpoint", &peer->p_endpoint.e_remote, sizeof(struct sockaddr));
-	i = count = 0;
-	CK_LIST_FOREACH(rt, &peer->p_routes, r_entry) {
-		count++;
-	}
-	aip = malloc(count*sizeof(*aip), M_TEMP, M_WAITOK);
-	CK_LIST_FOREACH(rt, &peer->p_routes, r_entry) {
-		memcpy(&aip[i++], &rt->r_cidr, sizeof(*aip));
-	}
-	nvlist_add_binary(nvl, "allowed-ips", aip, count*sizeof(*aip));
-	free(aip, M_TEMP);
-	return (nvl);
-}
-
 static int
 wg_peer_list(struct wg_softc *sc, struct ifdrv *ifd)
 {
-	struct wg_peer *peer;
-	int i, err, peer_count;
 	size_t size;
-	struct epoch_tracker et;
 	void *packed;
-	nvlist_t **nvl_array, *nvl;
+	nvlist_t *nvl, **nvl_array;
+	int err, peer_count;;
 
-	packed = NULL;
-	if ((peer_count = sc->sc_hashtable.h_num_peers) == 0) {
-		printf("no peers found\n");
-		return (ENOENT);
-	}
-	if ((nvl = nvlist_create(0)) == NULL)
-		return (ENOMEM);
-	err = i = 0;
-	nvl_array = malloc(peer_count*sizeof(void*), M_TEMP, M_WAITOK);
-	NET_EPOCH_ENTER(et);
-	CK_LIST_FOREACH(peer, &sc->sc_hashtable.h_peers_list, p_entry) {
-		nvl_array[i] = wg_peer_to_nvl(peer);
-		if (nvl_array[i] == NULL) {
-			printf("wg_peer_to_nvl failed on %d peer\n", i);
-			break;
-		}
-#ifdef INVARIANTS
-		packed = nvlist_pack(nvl_array[i], &size);
-		if (packed == NULL) {
-			printf("nvlist_pack(%p, %p) => %d",
-				   nvl_array[i], &size, nvlist_error(nvl));
-		}
-		free(packed, M_NVLIST);
-#endif	
-		i++;
-		if (i == peer_count)
-			break;
-	}
-	NET_EPOCH_EXIT(et);
-	peer_count = i;
-	if (peer_count == 0) {
-		printf("no peers found in list\n");
-		err = ENOENT;
-		goto out;
-	}
-	nvlist_add_nvlist_array(nvl, "peer-list",
-	    (const nvlist_t * const *)nvl_array, peer_count);
-	if ((err = nvlist_error(nvl))) {
-		printf("nvlist_add_nvlist_array(%p, \"peer-list\", %p, %d) => %d\n",
-			   nvl, nvl_array, peer_count, err);
-		goto out;
-	}
+	nvl = NULL;
+	peer_count = 0;
+	err = wg_marshal_peers(sc, &nvl, &nvl_array, &peer_count);
+	if (err)
+		return (err);
 	packed = nvlist_pack(nvl, &size);
 	if (packed == NULL) {
 		err = nvlist_error(nvl);
@@ -597,11 +653,9 @@ wg_peer_list(struct wg_softc *sc, struct ifdrv *ifd)
 		err = copyout(packed, ifd->ifd_data, size);
 	ifd->ifd_len = size;
  out:
-	free(packed, M_NVLIST);
+	//wg_marshalled_peers_free(nvl, nvl_array, peer_count);
 	nvlist_destroy(nvl);
-	for (i = 0; i < peer_count; i++)
-		nvlist_destroy(nvl_array[i]);
-	free(nvl_array, M_TEMP);
+	free(packed, M_NVLIST);
 	return (err);
 }
 
