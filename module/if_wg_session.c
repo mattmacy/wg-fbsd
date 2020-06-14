@@ -134,16 +134,8 @@ static struct mbuf *wg_queue_dequeue(struct wg_queue *, struct wg_tag **);
 
 /* Route */
 void	wg_route_destroy(struct wg_route_table *);
-int	wg_route_add(struct wg_route_table *, struct wg_peer *,
-    const struct wg_allowedip *);
-int	wg_route_delete(struct wg_route_table *, struct wg_peer *,
-    const struct wg_allowedip *);
 
 /* Hashtable */
-void	wg_hashtable_peer_insert(struct wg_hashtable *, struct wg_peer *);
-static struct wg_peer *wg_peer_lookup(struct wg_hashtable *,
-    const uint8_t [WG_KEY_SIZE]);
-void	wg_hashtable_peer_remove(struct wg_hashtable *, struct wg_peer *);
 
 /* Cookie */
 
@@ -151,7 +143,6 @@ static int wg_cookie_validate_packet(struct cookie_checker *, struct mbuf *,
     int);
 
 /* Peer */
-void	wg_peer_destroy(struct wg_peer **);
 void	wg_peer_free(epoch_context_t ctx);
 
 static void	wg_send_initiation(struct wg_peer *);
@@ -244,23 +235,6 @@ wg_mbuf_endpoint_get(struct mbuf *m)
  * Magic values baked in to handshake protocol
  */
 //static atomic64_t keypair_counter = ATOMIC64_INIT(0);
-
-static void
-wg_peer_magic_set(struct wg_peer *peer)
-{
-	peer->p_magic_1 = PEER_MAGIC1;
-	peer->p_magic_2 = PEER_MAGIC2;
-	peer->p_magic_3 = PEER_MAGIC3;
-
-}
-
-static void
-verify_peer_magic(struct wg_peer *peer)
-{
-	MPASS(peer->p_magic_1 == PEER_MAGIC1);
-	MPASS(peer->p_magic_2 == PEER_MAGIC2);
-	MPASS(peer->p_magic_3 == PEER_MAGIC3);
-}
 
 /* Socket */
 
@@ -387,6 +361,8 @@ wg_socket_bind(struct wg_softc *sc, struct wg_socket *so)
 	struct sockaddr_in6 *sin6;
 	struct ifnet *ifp;
 
+	if (so->so_port == 0)
+		return (0);
 	td = curthread;
 	bzero(&laddr, sizeof(laddr));
 	ifp = iflib_get_ifp(sc->wg_ctx);
@@ -886,6 +862,22 @@ wg_timers_disable(struct wg_timers *t)
 }
 
 void
+wg_timers_set_persistent_keepalive(struct wg_timers *t, uint16_t interval)
+{
+	if (t->t_disabled)
+		return;
+	t->t_persistent_keepalive_interval = interval;
+	wg_timers_run_persistent_keepalive(t);
+}
+
+int
+wg_timers_get_persistent_keepalive(struct wg_timers *t, uint16_t *interval)
+{
+	*interval = t->t_persistent_keepalive_interval;
+	return *interval > 0 ? 0 : ENOENT;
+}
+
+void
 wg_timers_get_last_handshake(struct wg_timers *t, struct timespec *time)
 {
 	time->tv_sec = t->t_handshake_complete.tv_sec;
@@ -1239,10 +1231,11 @@ wg_hashtable_peer_insert(struct wg_hashtable *ht, struct wg_peer *peer)
 	mtx_unlock(&ht->h_mtx);
 }
 
-static struct wg_peer *
-wg_peer_lookup(struct wg_hashtable *ht,
-			 const uint8_t pubkey[WG_KEY_SIZE])
+struct wg_peer *
+wg_peer_lookup(struct wg_softc *sc,
+    const uint8_t pubkey[WG_KEY_SIZE])
 {
+	struct wg_hashtable *ht = &sc->sc_hashtable;
 	uint64_t key;
 	struct wg_peer *i;
 
@@ -1300,61 +1293,21 @@ wg_cookie_validate_packet(struct cookie_checker *checker, struct mbuf *m,
 }
 
 /* Peer */
-int
-wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
+struct wg_peer *
+wg_peer_alloc(struct wg_softc *sc)
 {
 	struct wg_peer *peer;
-	const struct wg_allowedip *aip;
 	device_t dev;
-	int err;
 
-	peer = malloc(sizeof(*peer), M_WG, M_WAITOK|M_ZERO);
-	CK_LIST_INIT(&peer->p_routes);
-
-	aip = wpci->wpci_allowedip_list;
-	for (int i = 0; i < wpci->wpci_allowedip_count; i++, aip++) {
-		if ((err = wg_route_add(&sc->sc_routes, peer, aip)) != 0) {
-			printf("route add %d failed -> %d\n", i, err);
-		}
-	}
-
-#ifdef INVARIANTS
-	struct radix_node	*matchnode;
-	struct radix_node_head	*root;
-	struct sockaddr addr;
-	struct wg_route *route;
-
-	root = sc->sc_routes.t_ip;
-	addr = wpci->wpci_allowedip_list[0].a_addr;
-	matchnode = root->rnh_matchaddr(&addr, &root->rh);
-	route = (void *)matchnode;
-	MPASS(route->r_peer == peer);
-
-	aip = wpci->wpci_allowedip_list;
-	for (int i = 0; i < wpci->wpci_allowedip_count; i++, aip++) {
-		err = wg_route_delete(&sc->sc_routes, peer, aip);
-		MPASS(err == 0);
-		if ((err = wg_route_add(&sc->sc_routes, peer, aip)) != 0) {
-			printf("route add %d failed -> %d\n", i, err);
-		}
-	}
-#endif	
 	dev = iflib_get_dev(sc->wg_ctx);
+	peer = malloc(sizeof(*peer), M_WG, M_WAITOK|M_ZERO);
+	peer->p_sc = sc;
 	peer->p_id = atomic_fetchadd_long(&peer_counter, 1);
-
-
-	noise_remote_init(&peer->p_remote, __DECONST(uint8_t *, wpci->wpci_pub_key), &sc->sc_local);
-
-	wg_peer_magic_set(peer);
-	cookie_maker_init(&peer->p_cookie, __DECONST(uint8_t *, wpci->wpci_pub_key));
-	wg_peer_timers_init(peer);
+	CK_LIST_INIT(&peer->p_routes);
 
 	rw_init(&peer->p_endpoint_lock, "wg_peer_endpoint");
 	mtx_init(&peer->p_lock, "peer lock", NULL, MTX_DEF);
 	mtx_init(&peer->p_timers.t_handshake_mtx, "handshake lock", NULL, MTX_DEF);
-	bzero(&peer->p_endpoint, sizeof(peer->p_endpoint));
-	memcpy(&peer->p_endpoint.e_remote, wpci->wpci_endpoint,
-			    sizeof(peer->p_endpoint.e_remote));
 	wg_queue_init(&peer->p_encap_queue, "sendq");
 	wg_queue_init(&peer->p_decap_queue, "rxq");
 
@@ -1370,6 +1323,8 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	GROUPTASK_INIT(&peer->p_recv, 0, (gtask_fn_t *)wg_deliver_in, peer);
 	taskqgroup_attach(qgroup_if_io_tqg, &peer->p_recv, peer, dev, NULL, "wg recv");
 
+	wg_peer_timers_init(peer);
+
 	peer->p_tx_bytes = counter_u64_alloc(M_WAITOK);
 	peer->p_rx_bytes = counter_u64_alloc(M_WAITOK);
 
@@ -1381,23 +1336,13 @@ wg_peer_create(struct wg_softc *sc, struct wg_peer_create_info *wpci)
 	SLIST_INSERT_HEAD(&peer->p_unused_index, &peer->p_index[2],
 	    i_unused_entry);
 
-	wg_hashtable_peer_insert(&sc->sc_hashtable, peer);
-	peer->p_sc = sc;
-	DPRINTF(sc, "Peer %lu created\n", peer->p_id);
-	MPASS(sc->sc_hashtable.h_num_peers > 0);
-	verify_peer_magic(peer);
-	return (0);
+	return (peer);
 }
 
 void
-wg_peer_destroy(struct wg_peer **peer_p)
+wg_peer_destroy(struct wg_peer *peer)
 {
-	struct wg_peer *peer = *peer_p;
 	struct wg_route *route, *troute;
-
-	*peer_p = NULL;
-
-	wg_hashtable_peer_remove(&peer->p_sc->sc_hashtable, peer);
 
 	/* We first remove the peer from the hash table and route table, so
 	 * that it cannot be referenced again */
@@ -1834,8 +1779,6 @@ wg_encap(struct wg_softc *sc, struct mbuf *m)
 	t = wg_tag_get(m);
 	peer = t->t_peer;
 
-	verify_peer_magic(peer);
-
 	plaintext_len = MIN(WG_PKT_WITH_PADDING(m->m_pkthdr.len), t->t_mtu);
 	padding_len = plaintext_len - m->m_pkthdr.len;
 	out_len = sizeof(struct wg_pkt_data) + plaintext_len + NOISE_MAC_SIZE;
@@ -1997,7 +1940,7 @@ wg_remote_get(struct wg_softc *sc, uint8_t public[NOISE_KEY_SIZE])
 {
 	struct wg_peer *peer;
 
-	if ((peer = wg_peer_lookup(&sc->sc_hashtable, public)) == NULL)
+	if ((peer = wg_peer_lookup(sc, public)) == NULL)
 		return (NULL);
 	return (&peer->p_remote);
 }
@@ -2167,7 +2110,9 @@ wg_peer_remove_all(struct wg_softc *sc)
 	NET_EPOCH_ENTER(et);
 	CK_LIST_FOREACH_SAFE(peer, &sc->sc_hashtable.h_peers_list,
 	    p_entry, tpeer) {
-		wg_peer_destroy(&peer);
+		wg_hashtable_peer_remove(&peer->p_sc->sc_hashtable, peer);
+		/* FIXME -- needs to be deferred */
+		wg_peer_destroy(peer);
 	}
 	NET_EPOCH_EXIT(et);
 }

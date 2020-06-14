@@ -470,6 +470,7 @@ wg_marshal_peers(struct wg_softc *sc, nvlist_t **nvlp, nvlist_t ***nvl_arrayp, i
 	return (err);
 }
 
+#if 0
 static void
 wg_marshalled_peers_free(nvlist_t *nvl, nvlist_t **nvl_array, int peer_count)
 {
@@ -481,9 +482,10 @@ wg_marshalled_peers_free(nvlist_t *nvl, nvlist_t **nvl_array, int peer_count)
 	if (nvl)
 		nvlist_destroy(nvl);
 }
+#endif
 
 static int
-wg_local_show(struct wg_softc *sc, struct ifdrv *ifd)
+wgc_get(struct wg_softc *sc, struct ifdrv *ifd)
 {
 	nvlist_t *nvl, **nvl_array;
 	void *packed;
@@ -539,17 +541,188 @@ wg_allowedip_valid(const struct wg_allowedip *wip)
 }
 
 static int
-wg_peer_add(struct wg_softc *sc, struct ifdrv *ifd)
+wg_peer_add(struct wg_softc *sc, const nvlist_t *nvl)
 {
+	uint8_t			 public[WG_KEY_SIZE];
+	const void *pub_key;
+	const struct sockaddr *endpoint;
 	int i, err, allowedip_count;
+	device_t dev;
+	size_t size;
+	struct wg_peer *peer = NULL;
+	bool need_insert = false;
+
+	if (!nvlist_exists_binary(nvl, "public-key"))
+		return (EINVAL);
+
+	dev = iflib_get_dev(sc->wg_ctx);
+	pub_key = nvlist_get_binary(nvl, "public-key", &size);
+	if (size != CURVE25519_KEY_SIZE) {
+		device_printf(dev, "%s bad length for public-key %zu\n", __func__, size);
+		return (EINVAL);
+	}
+	if (noise_local_keys(&sc->sc_local, public, NULL) == 0 &&
+	    bcmp(public, pub_key, WG_KEY_SIZE) == 0)
+		return (EINVAL);
+	peer = wg_peer_lookup(sc, pub_key);
+	if (nvlist_exists_bool(nvl, "peer-remove")) {
+		if (peer == NULL)
+			return (0);
+		wg_hashtable_peer_remove(&sc->sc_hashtable, peer);
+		wg_peer_destroy(peer);
+		/* XXX free */
+		return (0);
+	}
+	if (nvlist_exists_bool(nvl, "replace-allowedips") &&
+	    peer != NULL) {
+		struct wg_route *route, *troute;
+
+		 CK_LIST_FOREACH_SAFE(route, &peer->p_routes, r_entry, troute)
+			wg_route_delete(&peer->p_sc->sc_routes, peer, &route->r_cidr);
+	}
+	if (peer == NULL) {
+		need_insert = true;
+		peer = wg_peer_alloc(sc);
+		noise_remote_init(&peer->p_remote, pub_key, &sc->sc_local);
+		cookie_maker_init(&peer->p_cookie, pub_key);
+	}
+	if (nvlist_exists_binary(nvl, "endpoint")) {
+		endpoint = nvlist_get_binary(nvl, "endpoint", &size);
+		if (size != sizeof(*endpoint)) {
+			device_printf(dev, "%s bad length for endpoint %zu\n", __func__, size);
+			err = EBADMSG;
+			goto out;
+		}
+		memcpy(&peer->p_endpoint.e_remote, endpoint,
+		    sizeof(peer->p_endpoint.e_remote));
+	}
+	if (nvlist_exists_binary(nvl, "pre-shared-key")) {
+		const void *key;
+
+		key = nvlist_get_binary(nvl, "pre-shared-key", &size);
+		noise_remote_set_psk(&peer->p_remote, key);
+	}
+	if (nvlist_exists_number(nvl, "persistent-keepalive-interval")) {
+		uint16_t pki;
+
+		pki = nvlist_get_number(nvl, "persistent-keepalive-interval");
+		wg_timers_set_persistent_keepalive(&peer->p_timers, pki);
+	}
+	if (nvlist_exists_binary(nvl, "allowed-ips")) {
+		const struct wg_allowedip *aip, *aip_base;
+
+		aip = aip_base = nvlist_get_binary(nvl, "allowed-ips", &size);
+		if (size % sizeof(struct wg_allowedip) != 0) {
+			device_printf(dev, "%s bad length for allowed-ips %zu not integer multiple of struct size\n", __func__, size);
+			err = EBADMSG;
+			goto out;
+		}
+		allowedip_count = size/sizeof(struct wg_allowedip);
+		for (i = 0; i < allowedip_count; i++) {
+			if (!wg_allowedip_valid(&aip_base[i])) {
+				device_printf(dev, "%s allowedip %d not valid\n", __func__, i);
+				err = EBADMSG;
+				goto out;
+			}
+		}
+		for (int i = 0; i < allowedip_count; i++, aip++) {
+			if ((err = wg_route_add(&sc->sc_routes, peer, aip)) != 0) {
+				printf("route add %d failed -> %d\n", i, err);
+			}
+		}
+	}
+	if (need_insert)
+		wg_hashtable_peer_insert(&sc->sc_hashtable, peer);
+	return (0);
+
+out:
+	wg_peer_destroy(peer);
+	return (err);
+}
+
+static int
+wgc_set(struct wg_softc *sc, struct ifdrv *ifd)
+{
+	uint8_t			 public[WG_KEY_SIZE];
 	void *nvlpacked;
 	nvlist_t *nvl;
 	device_t dev;
-	const struct sockaddr *endpoint;
-	const void *pub_key;
-	const struct wg_allowedip *allowedip_list;
-	struct wg_peer_create_info wpci;
-	size_t size;
+	ssize_t size;
+	int err;
+
+	if (ifd->ifd_len == 0 || ifd->ifd_data == NULL)
+		return (EFAULT);
+
+	dev = iflib_get_dev(sc->wg_ctx);
+	nvlpacked = malloc(ifd->ifd_len, M_TEMP, M_WAITOK);
+	err = copyin(ifd->ifd_data, nvlpacked, ifd->ifd_len);
+	if (err)
+		goto out;
+	nvl = nvlist_unpack(nvlpacked, ifd->ifd_len, 0);
+	if (nvl == NULL) {
+		device_printf(dev, "%s nvlist_unpack failed\n", __func__);
+		err = EBADMSG;
+		goto out;
+	}
+	if (nvlist_exists_bool(nvl, "replace-peers"))
+		wg_peer_remove_all(sc);
+	if (nvlist_exists_number(nvl, "listen-port")) {
+		int listen_port __unused = nvlist_get_number(nvl, "listen-port");
+			/*
+			 * Set listen port
+			 */
+		if_link_state_change(sc->sc_ifp, LINK_STATE_DOWN);
+		pause("link_down", hz/4);
+		wg_socket_close(&sc->sc_socket);
+		if ((err = wg_socket_init(sc)) != 0)
+			goto out;
+	   if_link_state_change(sc->sc_ifp, LINK_STATE_UP);
+	}
+	if (nvlist_exists_binary(nvl, "private-key")) {
+		struct noise_local *local;
+		const void *key = nvlist_get_binary(nvl, "private-key", &size);
+
+		if (size != CURVE25519_KEY_SIZE) {
+			device_printf(dev, "%s bad length for private-key %zu\n", __func__, size);
+			err = EBADMSG;
+			goto nvl_out;
+		}
+		/*
+		 * set private key
+		 */
+		local = &sc->sc_local;
+		noise_local_set_private(local, __DECONST(uint8_t *, key));
+		noise_local_keys(local, public, NULL);
+		cookie_checker_update(&sc->sc_cookie, public);
+	}
+	if (nvlist_exists_number(nvl, "user-cookie")) {
+		sc->sc_user_cookie = nvlist_get_number(nvl, "user-cookie");
+		/*
+		 * setsockopt
+		 */
+	}
+	if (nvlist_exists_nvlist_array(nvl, "peer-list")) {
+		size_t peercount;
+		const nvlist_t * const*nvl_peers;
+
+		nvl_peers = nvlist_get_nvlist_array(nvl, "peer-list", &peercount);
+		for (int i = 0; i < peercount; i++) {
+			wg_peer_add(sc, nvl_peers[i]);
+		}
+	}
+nvl_out:
+	nvlist_destroy(nvl);
+out:
+	free(nvlpacked, M_TEMP);
+	return (err);
+}
+
+static int
+wgc_peer_add(struct wg_softc *sc, struct ifdrv *ifd)
+{
+	void *nvlpacked;
+	nvlist_t *nvl;
+	int err;
 
 	if (ifd->ifd_len == 0 || ifd->ifd_data == NULL)
 		return (EFAULT);
@@ -563,55 +736,7 @@ wg_peer_add(struct wg_softc *sc, struct ifdrv *ifd)
 		err = EBADMSG;
 		goto out;
 	}
-	dev = iflib_get_dev(sc->wg_ctx);
-	if (!nvlist_exists_binary(nvl, "public-key")) {
-		device_printf(dev, "no public key provided for peer\n");
-		err = EBADMSG;
-		goto out;
-	}
-	if (!nvlist_exists_binary(nvl, "endpoint")) {
-		device_printf(dev, "no endpoint provided for peer\n");
-		err = EBADMSG;
-		goto out;
-	}
-	if (!nvlist_exists_binary(nvl, "allowed-ips")) {
-		device_printf(dev, "no allowed-ips provided for peer\n");
-		err = EBADMSG;
-		goto out;
-	}
-	pub_key = nvlist_get_binary(nvl, "public-key", &size);
-	if (size != CURVE25519_KEY_SIZE) {
-		device_printf(dev, "%s bad length for public-key %zu\n", __func__, size);
-		err = EBADMSG;
-		goto nvl_out;
-	}
-	endpoint = nvlist_get_binary(nvl, "endpoint", &size);
-	if (size != sizeof(*endpoint)) {
-		device_printf(dev, "%s bad length for endpoint %zu\n", __func__, size);
-		err = EBADMSG;
-		goto nvl_out;
-	}
-	allowedip_list = nvlist_get_binary(nvl, "allowed-ips", &size);
-	if (size % sizeof(struct wg_allowedip) != 0) {
-		device_printf(dev, "%s bad length for allowed-ips %zu not integer multiple of struct size\n", __func__, size);
-		err = EBADMSG;
-		goto nvl_out;
-	}
-	allowedip_count = size/sizeof(struct wg_allowedip);
-	for (i = 0; i < allowedip_count; i++) {
-		if (!wg_allowedip_valid(&allowedip_list[i])) {
-			device_printf(dev, "%s allowedip %d not valid\n", __func__, i);
-			err = EBADMSG;
-			goto nvl_out;
-		}
-	}
-	wpci.wpci_pub_key = pub_key;
-	wpci.wpci_endpoint = endpoint;
-	wpci.wpci_allowedip_list = allowedip_list;
-	wpci.wpci_allowedip_count = allowedip_count;
-
-	err = wg_peer_create(sc, &wpci);
- nvl_out:
+	err = wg_peer_add(sc, nvl);
 	nvlist_destroy(nvl);
 out:
 	free(nvlpacked, M_TEMP);
@@ -675,11 +800,14 @@ wg_priv_ioctl(if_ctx_t ctx, u_long command, caddr_t data)
 			return (EINVAL);
 	}
 	switch (ifd_cmd) {
-		case WGC_LOCAL_SHOW:
-			return (wg_local_show(sc, ifd));
+		case WGC_GET:
+			return (wgc_get(sc, ifd));
+			break;
+		case WGC_SET:
+			return (wgc_set(sc, ifd));
 			break;
 		case WGC_PEER_ADD:
-			return (wg_peer_add(sc, ifd));
+			return (wgc_peer_add(sc, ifd));
 			break;
 		case WGC_PEER_LIST:
 			return (wg_peer_list(sc, ifd));

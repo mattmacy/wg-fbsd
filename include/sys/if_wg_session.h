@@ -84,7 +84,8 @@ typedef enum {
 	WGC_PEER_DEL = 0x2,
 	WGC_PEER_UPDATE = 0x3,
 	WGC_PEER_LIST = 0x4,
-	WGC_LOCAL_SHOW = 0x5,
+	WGC_GET = 0x5,
+	WGC_SET = 0x6,
 } wg_cmd_t;
 
 #endif /* __IF_WG_H__ */

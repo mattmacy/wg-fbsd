@@ -202,6 +202,12 @@ struct wg_route {
 	struct wg_allowedip		 r_cidr;
 };
 
+
+int	wg_route_add(struct wg_route_table *, struct wg_peer *,
+    const struct wg_allowedip *);
+int	wg_route_delete(struct wg_route_table *, struct wg_peer *,
+    const struct wg_allowedip *);
+
 /* Noise */
 
 /*
@@ -212,14 +218,6 @@ struct wg_route {
  */
 
 struct wg_softc;
-
-struct wg_peer_create_info {
-	const void *wpci_pub_key;
-	const struct sockaddr *wpci_endpoint;
-	const struct wg_allowedip *wpci_allowedip_list;
-	int wpci_allowedip_count;
-};
-
 
 struct wg_hashtable {
 	struct mtx			 h_mtx;
@@ -239,6 +237,7 @@ struct wg_softc {
 	if_ctx_t wg_ctx;
 	struct ifnet 		 *sc_ifp;
 	uint16_t		sc_incoming_port;
+	uint32_t		sc_user_cookie;
 
 	struct wg_socket	 sc_socket;
 	struct wg_hashtable	 sc_hashtable;
@@ -273,16 +272,23 @@ struct wg_tag {
 	int		t_mtu;
 };
 
+int wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
+    const struct wg_allowedip *cidr_);
 
-struct wg_peer *
-	wg_route_lookup(struct wg_route_table *, struct mbuf *,
-				enum route_direction);
+struct wg_peer *wg_route_lookup(struct wg_route_table *, struct mbuf *,
+    enum route_direction);
 
 void	wg_peer_remove_all(struct wg_softc *);
-int	wg_peer_create(struct wg_softc *, struct wg_peer_create_info *);
+struct wg_peer *wg_peer_alloc(struct wg_softc *);
+void	wg_peer_destroy(struct wg_peer *);
 
 void	wg_hashtable_init(struct wg_hashtable *);
 void	wg_hashtable_destroy(struct wg_hashtable *);
+void	wg_hashtable_peer_insert(struct wg_hashtable *, struct wg_peer *);
+struct wg_peer *wg_peer_lookup(struct wg_softc *,
+    const uint8_t [WG_KEY_SIZE]);
+void	wg_hashtable_peer_remove(struct wg_hashtable *, struct wg_peer *);
+
 
 int	wg_queue_out(struct wg_peer *peer, struct mbuf *m);
 
@@ -291,9 +297,14 @@ int	wg_route_init(struct wg_route_table *);
 int wg_socket_init(struct wg_softc *sc);
 void wg_socket_reinit(struct wg_softc *, struct socket *so4,
     struct socket *so6);
+int wg_socket_close(struct wg_socket *so);
+
 void wg_softc_handshake_receive(struct wg_softc *sc);
 
+int	wg_timers_get_persistent_keepalive(struct wg_timers *,  uint16_t *);
+void	wg_timers_set_persistent_keepalive(struct wg_timers *t, uint16_t);
 void	wg_timers_get_last_handshake(struct wg_timers *, struct timespec *);
+
 
 struct noise_remote *wg_remote_get(struct wg_softc *, uint8_t [NOISE_KEY_SIZE]);
 uint32_t wg_index_set(struct wg_softc *, struct noise_remote *);
