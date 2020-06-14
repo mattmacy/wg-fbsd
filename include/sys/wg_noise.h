@@ -241,7 +241,7 @@ int	noise_local_keys(struct noise_local *, uint8_t[NOISE_KEY_SIZE],
 
 void	noise_remote_init(struct noise_remote *, const uint8_t[NOISE_KEY_SIZE],
 	    struct noise_local *);
-int	noise_remote_set_psk(struct noise_remote *, uint8_t[NOISE_PSK_SIZE]);
+int	noise_remote_set_psk(struct noise_remote *, const uint8_t[NOISE_PSK_SIZE]);
 int	noise_remote_keys(struct noise_remote *, uint8_t[NOISE_KEY_SIZE],
 	    uint8_t[NOISE_PSK_SIZE]);
 

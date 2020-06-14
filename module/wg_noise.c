@@ -150,7 +150,7 @@ noise_remote_init(struct noise_remote *r, const uint8_t public[NOISE_KEY_SIZE],
 }
 
 int
-noise_remote_set_psk(struct noise_remote *r, uint8_t psk[NOISE_PSK_SIZE])
+noise_remote_set_psk(struct noise_remote *r, const uint8_t psk[NOISE_PSK_SIZE])
 {
 	int same;
 	rw_enter_write(&r->r_handshake_lock);
