@@ -155,7 +155,7 @@ struct cookie_checker {
 	uint8_t			cc_secret[COOKIE_SECRET_SIZE];
 };
 
-void	cookie_maker_init(struct cookie_maker *, uint8_t[COOKIE_INPUT_SIZE]);
+void	cookie_maker_init(struct cookie_maker *, const uint8_t[COOKIE_INPUT_SIZE]);
 int	cookie_checker_init(struct cookie_checker *, uma_zone_t);
 void	cookie_checker_update(struct cookie_checker *,
 	    uint8_t[COOKIE_INPUT_SIZE]);

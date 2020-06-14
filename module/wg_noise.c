@@ -129,7 +129,7 @@ noise_local_keys(struct noise_local *l, uint8_t public[NOISE_KEY_SIZE],
 }
 
 void
-noise_remote_init(struct noise_remote *r, uint8_t public[NOISE_KEY_SIZE],
+noise_remote_init(struct noise_remote *r, const uint8_t public[NOISE_KEY_SIZE],
     struct noise_local *l)
 {
 	bzero(r, sizeof(*r));

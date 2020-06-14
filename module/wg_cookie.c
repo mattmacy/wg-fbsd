@@ -39,7 +39,7 @@ static int	ratelimit_allow(struct ratelimit *, struct sockaddr *);
 
 /* Public Functions */
 void
-cookie_maker_init(struct cookie_maker *cp, uint8_t key[COOKIE_INPUT_SIZE])
+cookie_maker_init(struct cookie_maker *cp, const uint8_t key[COOKIE_INPUT_SIZE])
 {
 	bzero(cp, sizeof(*cp));
 	cookie_precompute_key(cp->cp_mac1_key, key, COOKIE_MAC1_KEY_LABEL);
