@@ -138,6 +138,14 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	size_t size;
 
 	err = 0;
+	dev = iflib_get_dev(ctx);
+	if (params == NULL) {
+		key = NULL;
+		listen_port = 0;
+		nvl = NULL;
+		packed = NULL;
+		goto unpacked;
+	}
 	if (copyin(params, &iov, sizeof(iov)))
 		return (EFAULT);
 	/* check that this is reasonable */
@@ -147,7 +155,6 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 		err = EFAULT;
 		goto out;
 	}
-	dev = iflib_get_dev(ctx);
 	nvl = nvlist_unpack(packed, size, 0);
 	if (nvl == NULL) {
 		device_printf(dev, "%s nvlist_unpack failed\n", __func__);
@@ -172,7 +179,7 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 		err = EBADMSG;
 		goto nvl_out;
 	}
-
+unpacked:
 	local = &sc->sc_local;
 	noise_upcall.u_arg = sc;
 	noise_upcall.u_remote_get =
@@ -185,14 +192,12 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	cookie_checker_init(&sc->sc_cookie, ratelimit_zone);
 
 	sc->sc_socket.so_port = listen_port;
-	/*
-	 * XXX init local_alloc
-	 */
 
-	noise_local_set_private(local, __DECONST(uint8_t *, key));
-	noise_local_keys(local, public, NULL);
-	cookie_checker_update(&sc->sc_cookie, public);
-	
+	if (key != NULL) {
+		noise_local_set_private(local, __DECONST(uint8_t *, key));
+		noise_local_keys(local, public, NULL);
+		cookie_checker_update(&sc->sc_cookie, public);
+	}
 	atomic_add_int(&clone_count, 1);
 	scctx = sc->shared = iflib_get_softc_ctx(ctx);
 	scctx->isc_capenable = WG_CAPS;
@@ -211,7 +216,8 @@ wg_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t par
 	taskqgroup_attach(qgroup_if_io_tqg, &sc->sc_handshake, sc, dev, NULL, "wg tx initiation");
 	crypto_taskq_setup(sc);
  nvl_out:
-	nvlist_destroy(nvl);
+	if (nvl != NULL)
+		nvlist_destroy(nvl);
 out:
 	free(packed, M_TEMP);
 	return (err);
