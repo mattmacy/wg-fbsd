@@ -682,7 +682,8 @@ wgc_set(struct wg_softc *sc, struct ifdrv *ifd)
 			 */
 		if_link_state_change(sc->sc_ifp, LINK_STATE_DOWN);
 		pause("link_down", hz/4);
-		wg_socket_close(&sc->sc_socket);
+		wg_socket_reinit(sc, NULL, NULL);
+		sc->sc_socket.so_port = listen_port;
 		if ((err = wg_socket_init(sc)) != 0)
 			goto out;
 	   if_link_state_change(sc->sc_ifp, LINK_STATE_UP);
