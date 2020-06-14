@@ -504,15 +504,18 @@ wgc_get(struct wg_softc *sc, struct ifdrv *ifd)
 
 	err = 0;
 	packed = NULL;
-	nvlist_add_number(nvl, "listen-port", sc->sc_socket.so_port);
-	nvlist_add_binary(nvl, "public-key", sc->sc_local.l_public, WG_KEY_SIZE);
-	nvlist_add_binary(nvl, "private-key", sc->sc_local.l_private, WG_KEY_SIZE);
-	err = wg_marshal_peers(sc, NULL, &nvl_array, &peer_count);
-	if (err == 0) {
+	if (sc->sc_socket.so_port != 0)
+		nvlist_add_number(nvl, "listen-port", sc->sc_socket.so_port);
+	if (sc->sc_local.l_has_identity) {
+		nvlist_add_binary(nvl, "public-key", sc->sc_local.l_public, WG_KEY_SIZE);
+		nvlist_add_binary(nvl, "private-key", sc->sc_local.l_private, WG_KEY_SIZE);
+	}
+	if (sc->sc_hashtable.h_num_peers > 0) {
+		err = wg_marshal_peers(sc, NULL, &nvl_array, &peer_count);
+		if (err)
+			goto out;
 		nvlist_add_nvlist_array(nvl, "peer-list",
-	        (const nvlist_t * const *)nvl_array, peer_count);
-	} else if  (err && err != ENOENT) {
-		goto out;
+		    (const nvlist_t * const *)nvl_array, peer_count);
 	}
 	packed = nvlist_pack(nvl, &size);
 	if (packed == NULL)
