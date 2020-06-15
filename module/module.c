@@ -590,10 +590,8 @@ wg_peer_add(struct wg_softc *sc, const nvlist_t *nvl)
 	if (nvlist_exists_bool(nvl, "replace-allowedips") &&
 		nvlist_get_bool(nvl, "replace-allowedips") &&
 	    peer != NULL) {
-		struct wg_route *route, *troute;
 
-		 CK_LIST_FOREACH_SAFE(route, &peer->p_routes, r_entry, troute)
-			wg_route_delete(&peer->p_sc->sc_routes, peer, &route->r_cidr);
+		wg_route_delete(&peer->p_sc->sc_routes, peer);
 	}
 	if (peer == NULL) {
 		need_insert = true;

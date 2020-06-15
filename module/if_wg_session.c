@@ -1076,56 +1076,50 @@ wg_route_add(struct wg_route_table *tbl, struct wg_peer *peer,
 	return (0);
 }
 
-int
-wg_route_delete(struct wg_route_table *tbl, struct wg_peer *peer,
-		const struct wg_allowedip *cidr)
+struct peer_del_arg {
+	struct radix_node_head * pda_head;
+	struct wg_peer *pda_peer;
+	struct wg_route_table *pda_tbl;
+};
+
+static int
+wg_peer_remove(struct radix_node *rn, void *arg)
 {
-	int ret = 0;
-	struct radix_node	*node;
-	struct radix_node_head	*root;
-	struct wg_route *route = NULL;
-	bool needfree = false;
-	sa_family_t family;
-	struct sockaddr mask;
-	struct sockaddr addr;
+	struct peer_del_arg *pda = arg;
+	struct wg_peer *peer = pda->pda_peer;
+	struct radix_node_head * rnh = pda->pda_head;
+	struct wg_route_table *tbl = pda->pda_tbl;
+	struct wg_route *route = (struct wg_route *)rn;
+	struct radix_node *x;
 
-	family = cidr->a_addr.sa_family;
-	mask = cidr->a_mask;
-	addr = cidr->a_addr;
-
-	family = cidr->a_addr.sa_family;
-	if (family == AF_INET)
-		root = tbl->t_ip;
-	else if (family == AF_INET6)
-		root = tbl->t_ip6;
-	else
-		return EINVAL;
-
-	RADIX_NODE_HEAD_LOCK(root);
-	if ((node = root->rnh_matchaddr(&addr, &root->rh)) != NULL) {
-
-		if (root->rnh_deladdr(&addr, &mask, &root->rh) == NULL)
-			panic("del_addr failed to delete node %p", node);
-
-		/* We can type alias as node is the first elem in route */
-		route = (struct wg_route *) node;
-
-		if (route->r_peer == peer) {
-			tbl->t_count--;
-			CK_LIST_REMOVE(route, r_entry);
-			needfree = true;
-		} else {
-			ret = EHOSTUNREACH;
-		}
-
-	} else {
-		ret = ENOATTR;
-	}
-	RADIX_NODE_HEAD_UNLOCK(root);
-	if (needfree) {
+	if (route->r_peer != peer)
+		return (0);
+	x = (struct radix_node *)rnh->rnh_deladdr(&route->r_cidr.a_addr, NULL, &rnh->rh);
+	if (x != NULL)	 {
+		tbl->t_count--;
+		CK_LIST_REMOVE(route, r_entry);
 		free(route, M_WG);
 	}
-	return ret;
+	return (0);
+}
+
+int
+wg_route_delete(struct wg_route_table *tbl, struct wg_peer *peer)
+{
+	struct peer_del_arg pda;
+
+	pda.pda_peer = peer;
+	pda.pda_tbl = tbl;
+	RADIX_NODE_HEAD_LOCK(tbl->t_ip);
+	pda.pda_head = tbl->t_ip;
+	rn_walktree(&tbl->t_ip->rh, wg_peer_remove, &pda);
+	RADIX_NODE_HEAD_UNLOCK(tbl->t_ip);
+
+	RADIX_NODE_HEAD_LOCK(tbl->t_ip6);
+	pda.pda_head = tbl->t_ip6;
+	rn_walktree(&tbl->t_ip6->rh, wg_peer_remove, &pda);
+	RADIX_NODE_HEAD_UNLOCK(tbl->t_ip6);
+	return (0);
 }
 
 struct wg_peer *
@@ -1342,12 +1336,10 @@ wg_peer_alloc(struct wg_softc *sc)
 void
 wg_peer_destroy(struct wg_peer *peer)
 {
-	struct wg_route *route, *troute;
 
 	/* We first remove the peer from the hash table and route table, so
 	 * that it cannot be referenced again */
-	CK_LIST_FOREACH_SAFE(route, &peer->p_routes, r_entry, troute)
-		wg_route_delete(&peer->p_sc->sc_routes, peer, &route->r_cidr);
+	wg_route_delete(&peer->p_sc->sc_routes, peer);
 	MPASS(CK_LIST_EMPTY(&peer->p_routes));
 
 	/* TODO currently, if there is a timer added after here, then the peer

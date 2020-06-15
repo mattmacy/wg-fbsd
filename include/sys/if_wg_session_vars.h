@@ -197,16 +197,15 @@ struct wg_peer;
 
 struct wg_route {
 	struct radix_node		 r_nodes[2];
+	struct wg_allowedip		 r_cidr;
 	CK_LIST_ENTRY(wg_route)	 r_entry;
 	struct wg_peer		*r_peer;
-	struct wg_allowedip		 r_cidr;
 };
 
 
 int	wg_route_add(struct wg_route_table *, struct wg_peer *,
     const struct wg_allowedip *);
-int	wg_route_delete(struct wg_route_table *, struct wg_peer *,
-    const struct wg_allowedip *);
+int	wg_route_delete(struct wg_route_table *, struct wg_peer *);
 
 /* Noise */
 
