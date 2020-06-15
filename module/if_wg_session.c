@@ -1237,7 +1237,7 @@ wg_peer_lookup(struct wg_softc *sc,
 {
 	struct wg_hashtable *ht = &sc->sc_hashtable;
 	uint64_t key;
-	struct wg_peer *i;
+	struct wg_peer *i = NULL;
 
 	key = siphash24(&ht->h_secret, pubkey, WG_KEY_SIZE);
 

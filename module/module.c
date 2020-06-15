@@ -560,29 +560,35 @@ wg_peer_add(struct wg_softc *sc, const nvlist_t *nvl)
 	size_t size;
 	struct wg_peer *peer = NULL;
 	bool need_insert = false;
-
-	if (!nvlist_exists_binary(nvl, "public-key"))
-		return (EINVAL);
-
 	dev = iflib_get_dev(sc->wg_ctx);
+
+	if (!nvlist_exists_binary(nvl, "public-key")) {
+		device_printf(dev, "peer has no public-key\n");
+		return (EINVAL);
+	}
 	pub_key = nvlist_get_binary(nvl, "public-key", &size);
 	if (size != CURVE25519_KEY_SIZE) {
 		device_printf(dev, "%s bad length for public-key %zu\n", __func__, size);
 		return (EINVAL);
 	}
 	if (noise_local_keys(&sc->sc_local, public, NULL) == 0 &&
-	    bcmp(public, pub_key, WG_KEY_SIZE) == 0)
+	    bcmp(public, pub_key, WG_KEY_SIZE) == 0) {
+		device_printf(dev, "public-key for peer already in use by host\n");
 		return (EINVAL);
+	}
 	peer = wg_peer_lookup(sc, pub_key);
-	if (nvlist_exists_bool(nvl, "peer-remove")) {
-		if (peer == NULL)
-			return (0);
-		wg_hashtable_peer_remove(&sc->sc_hashtable, peer);
-		wg_peer_destroy(peer);
-		/* XXX free */
+	if (nvlist_exists_bool(nvl, "peer-remove") &&
+		nvlist_get_bool(nvl, "peer-remove")) {
+		if (peer != NULL) {
+			wg_hashtable_peer_remove(&sc->sc_hashtable, peer);
+			wg_peer_destroy(peer);
+			/* XXX free */
+			printf("peer removed\n");
+		}
 		return (0);
 	}
 	if (nvlist_exists_bool(nvl, "replace-allowedips") &&
+		nvlist_get_bool(nvl, "replace-allowedips") &&
 	    peer != NULL) {
 		struct wg_route *route, *troute;
 
@@ -673,7 +679,8 @@ wgc_set(struct wg_softc *sc, struct ifdrv *ifd)
 		err = EBADMSG;
 		goto out;
 	}
-	if (nvlist_exists_bool(nvl, "replace-peers"))
+	if (nvlist_exists_bool(nvl, "replace-peers") &&
+		nvlist_get_bool(nvl, "replace-peers"))
 		wg_peer_remove_all(sc);
 	if (nvlist_exists_number(nvl, "listen-port")) {
 		int listen_port __unused = nvlist_get_number(nvl, "listen-port");
