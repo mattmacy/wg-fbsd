@@ -292,6 +292,7 @@ void	wg_hashtable_peer_remove(struct wg_hashtable *, struct wg_peer *);
 int	wg_queue_out(struct wg_peer *peer, struct mbuf *m);
 
 int	wg_route_init(struct wg_route_table *);
+void	wg_route_destroy(struct wg_route_table *);
 
 int wg_socket_init(struct wg_softc *sc);
 void wg_socket_reinit(struct wg_softc *, struct socket *so4,

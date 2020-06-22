@@ -323,13 +323,14 @@ wg_detach(if_ctx_t ctx)
 	wg_peer_remove_all(sc);
 	mtx_destroy(&sc->sc_mtx);
 	rw_destroy(&sc->sc_index_lock);
+	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_handshake);
+	crypto_taskq_destroy(sc);
 	buf_ring_free(sc->sc_encap_ring, M_WG);
 	buf_ring_free(sc->sc_decap_ring, M_WG);
 
-	taskqgroup_detach(qgroup_if_io_tqg, &sc->sc_handshake);
-	crypto_taskq_destroy(sc);
+	wg_route_destroy(&sc->sc_routes);
+	wg_hashtable_destroy(&sc->sc_hashtable);
 	atomic_add_int(&clone_count, -1);
-
 	return (0);
 }
 

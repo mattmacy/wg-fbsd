@@ -143,8 +143,6 @@ static int wg_cookie_validate_packet(struct cookie_checker *, struct mbuf *,
     int);
 
 /* Peer */
-void	wg_peer_free(epoch_context_t ctx);
-
 static void	wg_send_initiation(struct wg_peer *);
 static void	wg_send_cookie(struct wg_softc *, struct cookie_macs *, uint32_t, struct mbuf *);
 
@@ -916,6 +914,9 @@ wg_queue_init(struct wg_queue *q, const char *name)
 void
 wg_queue_deinit(struct wg_queue*q)
 {
+	mtx_lock(&q->q_mtx);
+	mbufq_drain(&q->q);
+	mtx_unlock(&q->q_mtx);
 	mtx_destroy(&q->q_mtx);
 }
 
@@ -1206,6 +1207,7 @@ wg_hashtable_destroy(struct wg_hashtable *ht)
 {
 	MPASS(ht->h_num_peers == 0);
 	MPASS(ht->h_num_keys == 0);
+	mtx_destroy(&ht->h_mtx);
 	hashdestroy(ht->h_peers, M_DEVBUF, ht->h_peers_mask);
 	hashdestroy(ht->h_keys, M_DEVBUF, ht->h_keys_mask);
 }
@@ -1300,8 +1302,6 @@ wg_peer_alloc(struct wg_softc *sc)
 	CK_LIST_INIT(&peer->p_routes);
 
 	rw_init(&peer->p_endpoint_lock, "wg_peer_endpoint");
-	mtx_init(&peer->p_lock, "peer lock", NULL, MTX_DEF);
-	mtx_init(&peer->p_timers.t_handshake_mtx, "handshake lock", NULL, MTX_DEF);
 	wg_queue_init(&peer->p_encap_queue, "sendq");
 	wg_queue_init(&peer->p_decap_queue, "rxq");
 
@@ -1333,6 +1333,21 @@ wg_peer_alloc(struct wg_softc *sc)
 	return (peer);
 }
 
+static void
+wg_peer_free_deferred(epoch_context_t ctx)
+{
+	struct wg_peer *peer;
+
+	peer = __containerof(ctx, struct wg_peer, p_ctx);
+	counter_u64_free(peer->p_tx_bytes);
+	counter_u64_free(peer->p_rx_bytes);
+
+	DPRINTF(peer->p_sc, "Peer %lu destroyed\n", peer->p_id);
+	rw_destroy(&peer->p_timers.t_lock);
+	rw_destroy(&peer->p_endpoint_lock);
+	zfree(peer, M_WG);
+}
+
 void
 wg_peer_destroy(struct wg_peer *peer)
 {
@@ -1357,22 +1372,7 @@ wg_peer_destroy(struct wg_peer *peer)
 	taskqgroup_detach(qgroup_if_io_tqg, &peer->p_send);
 	wg_queue_deinit(&peer->p_encap_queue);
 	wg_queue_deinit(&peer->p_decap_queue);
-}
-
-void
-wg_peer_free(epoch_context_t ctx)
-{
-	struct wg_peer *peer;
-
-	peer = __containerof(ctx, struct wg_peer, p_ctx);
-	counter_u64_free(peer->p_tx_bytes);
-	counter_u64_free(peer->p_rx_bytes);
-
-	DPRINTF(peer->p_sc, "Peer %lu destroyed\n", peer->p_id);
-	mtx_destroy(&peer->p_lock);
-	mtx_destroy(&peer->p_timers.t_handshake_mtx);
-	rw_destroy(&peer->p_endpoint_lock);
-	zfree(peer, M_WG);
+	NET_EPOCH_CALL(wg_peer_free_deferred, &peer->p_ctx);
 }
 
 static void
