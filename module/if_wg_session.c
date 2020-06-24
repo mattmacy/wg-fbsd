@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2019 Matt Dunwoodie <ncon@noconroy.net>
+ * Copyright (C) 2015-2020 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+ * Copyright (C) 2019-2020 Matt Dunwoodie <ncon@noconroy.net>
  * Copyright (c) 2019-2020 Netgate, Inc.
  *
  * Permission to use, copy, modify, and distribute this software for any
