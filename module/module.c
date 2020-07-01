@@ -215,6 +215,7 @@ unpacked:
 	    (gtask_fn_t *)wg_softc_handshake_receive, sc);
 	taskqgroup_attach(qgroup_if_io_tqg, &sc->sc_handshake, sc, dev, NULL, "wg tx initiation");
 	crypto_taskq_setup(sc);
+	if_addgroup(iflib_get_ifp(ctx), "wg");
  nvl_out:
 	if (nvl != NULL)
 		nvlist_destroy(nvl);
@@ -318,6 +319,8 @@ wg_detach(if_ctx_t ctx)
 	struct wg_softc *sc;
 
 	sc = iflib_get_softc(ctx);
+	if_delgroup(iflib_get_ifp(ctx), "wg");
+
 	//sc->wg_accept_port = 0;
 	wg_socket_reinit(sc, NULL, NULL);
 	wg_peer_remove_all(sc);
